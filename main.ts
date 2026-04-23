@@ -1,5 +1,5 @@
 // =========================================================
-// Deno Edge Service - VLESS Proxy (Optimized for Deno Deploy)
+// Deno Edge Service -  (Optimized for Deno Deploy)
 // 优化点：
 // 1. 零分配解析：减少 Uint8Array 切片和复制
 // 2. 更严格的握手校验：防止指纹识别
