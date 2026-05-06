@@ -637,9 +637,16 @@ def run():
         export_df["成交额描述"] = env.get("成交额描述", "")
         export_df["市场环境"] = env["环境评级"]
         export_df["市场评分"] = env["综合评分"]
-        file = f"市场环境监控_{today}.xlsx"
-        export_df.to_excel(file, index=False)
-        print(f"\n[完成] 监控报告已生成: {file}")
+        
+        # GitHub Actions环境输出到仓库根目录，本地环境输出到当前目录
+import os
+if os.environ.get('GITHUB_ACTIONS') == 'true':
+    output_dir = os.environ.get('GITHUB_WORKSPACE', '.')
+    file = os.path.join(output_dir, f"市场环境监控_{today}.xlsx")
+else:
+    file = f"市场环境监控_{today}.xlsx"
+export_df.to_excel(file, index=False)
+print(f"\n[完成] 监控报告已生成: {file}")
     except:
         print(f"\n[提示] Excel导出失败，请查看上方汇总数据")
 
