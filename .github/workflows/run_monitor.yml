@@ -1,0 +1,33 @@
+name: 市场环境监控
+
+on:
+  schedule:
+    # 北京时间每个交易日 15:30 运行（UTC 7:30）
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v4
+    
+    - name: 设置Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: 安装依赖
+      run: |
+        pip install -r requirements.txt
+    
+    - name: 运行监控
+      run: python market_monitor.py
+    
+    - name: 上传报告
+      uses: actions/upload-artifact@v4
+      with:
+        name: 监控报告
+        path: 市场环境监控_*.xlsx
