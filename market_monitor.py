@@ -659,5 +659,10 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
 
+    # GitHub Actions环境不需要等待输入
+import os
+if os.environ.get('GITHUB_ACTIONS') != 'true':
     print("\n按回车键退出...")
     input()
+else:
+    print("\n[GitHub Actions] 运行完成")
