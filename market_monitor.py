@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3
-# 更新：Rank IC + 底分型包含处理 + 波动压缩联动 + 时区修复 + 仓位建议
+# 市场环境监控仪表盘 - 工程化校准版 v3.1
+# 更新：总仓位与个股仓位分层输出 + 自检通过
 
 import subprocess
 import sys
@@ -30,9 +30,9 @@ beijing_now = utc_now.astimezone(timezone(timedelta(hours=8)))
 TODAY = beijing_now.strftime("%Y-%m-%d")
 
 monitor_stocks = {
-    "中信证券": {"code": "600030", "role": "压舱石_望远镜"},
-    "赤峰黄金": {"code": "600988", "role": "避险矛_显微镜"},
-    "西藏矿业": {"code": "000762", "role": "弹性牌_信号灯"}
+    "中信证券": {"code": "600030", "role": "压舱石_望远镜", "weight": 0.55},
+    "赤峰黄金": {"code": "600988", "role": "避险矛_显微镜", "weight": 0.30},
+    "西藏矿业": {"code": "000762", "role": "弹性牌_信号灯", "weight": 0.15}
 }
 
 FACTOR_COLS = ["trend_score", "momentum_score", "volatility_score", "volume_score",
@@ -283,11 +283,9 @@ def calc_composite_scores(df, stock_name, role):
         df["composite_score"] = 0.15
         return df, 0.15, bottom_info
     weights = calc_ic_weights(df, FACTOR_COLS, "ret", lookback=60)
-    # 底分型确认时，波动压缩权重翻倍
     if role == "弹性牌_信号灯" and bottom_info.get("is_bottom"):
         if "vol_compress_score" in weights:
             weights["vol_compress_score"] = min(weights["vol_compress_score"] * 2, 0.5)
-            # 重新归一化
             total = sum(weights.values()) + 1e-6
             weights = {k: v/total for k, v in weights.items()}
     score = 0
@@ -393,7 +391,7 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
 
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3）")
+    print("  市场环境监控仪表盘（工程化校准版 v3.1）")
     print("="*60 + "\n")
     logger.info(f"开始运行监控，日期: {TODAY}")
     idx_df, market_turnover = get_index_data()
@@ -419,21 +417,35 @@ def run():
             if k not in row: row[k] = v
         summary_rows.append(row)
     env = calc_market_environment(scores, diagnoses, market_turnover)
-    # 仓位建议
-    if env['综合评分'] >= 0.75: pos_advice = "建议仓位: 60-80%"
-    elif env['综合评分'] >= 0.60: pos_advice = "建议仓位: 40-60%"
-    elif env['综合评分'] >= 0.45: pos_advice = "建议仓位: 20-40%"
-    elif env['综合评分'] >= 0.30: pos_advice = "建议仓位: 10-20%"
-    else: pos_advice = "建议仓位: ≤10% 或空仓"
+
+    # 总仓位建议
+    if env['综合评分'] >= 0.75: total_pos = "60-80%"
+    elif env['综合评分'] >= 0.60: total_pos = "40-60%"
+    elif env['综合评分'] >= 0.45: total_pos = "20-40%"
+    elif env['综合评分'] >= 0.30: total_pos = "10-20%"
+    else: total_pos = "≤10%"
+
+    # 每只标的的建议仓位
+    total_low = int(total_pos.split('-')[0].replace('%','').replace('≤','').strip())
+    for row in summary_rows:
+        name = row["标的"]
+        w = monitor_stocks[name]["weight"]
+        stock_pos = f"{total_low * w:.0f}%"
+        row["建议个股仓位"] = stock_pos
+
     print("="*60)
     print(f"标的均分:{env['标的平均评分']:.3f} | 活跃度:{env['市场活跃度']:.3f} | {env['成交额描述']}")
     print(f"环境:{env['环境评级']} | 综合:{env['综合评分']:.3f}")
-    print(f"建议:{env['建议']} | {pos_advice}")
+    print(f"总仓位建议: {total_pos}")
+    for row in summary_rows:
+        print(f"  {row['标的']}: {row['建议个股仓位']}")
+    print(f"建议:{env['建议']}")
     print("="*60)
+
     try:
         export_df = pd.DataFrame(summary_rows)
         export_df["日期"] = TODAY
-        export_df["仓位建议"] = pos_advice
+        export_df["总仓位建议"] = total_pos
         export_df["标的平均评分"] = env["标的平均评分"]
         export_df["市场活跃度"] = env["市场活跃度"]
         export_df["成交额描述"] = env.get("成交额描述","")
