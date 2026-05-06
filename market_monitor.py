@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3.1
-# 更新：总仓位与个股仓位分层输出 + 自检通过
+# 市场环境监控仪表盘 - 工程化校准版 v3.2
+# 更新：动态仓位分配 + 止损距离显示 + 防断流兜底 + 自检通过
 
 import subprocess
 import sys
@@ -196,6 +196,16 @@ def get_index_data(tail_size=500):
                     if turnover: break
             except:
                 if attempt < 2: time.sleep(2)
+    # 最终兜底：用实时行情接口强行补齐
+    if df_result.empty or turnover is None:
+        try:
+            spot = ak.stock_zh_a_spot_em()
+            sh_row = spot[spot["代码"] == "sh000001"]
+            if not sh_row.empty:
+                df_result = pd.DataFrame([{"date": TODAY, "close": float(sh_row["最新价"].iloc[0]), "ret": 0.0}])
+                raw_amt = float(sh_row["成交额"].iloc[0]) if "成交额" in sh_row.columns else 0
+                turnover = normalize_turnover(raw_amt) if raw_amt > 0 else None
+        except: pass
     if not df_result.empty: return df_result, turnover
     else: return pd.DataFrame(), None
 
@@ -356,7 +366,12 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
             d = bottom_info["details"]
             diag["底分型"] = "✅ 已确认" if bottom_info.get("is_bottom") else ("⏳ 待缩量确认" if d.get("底分型形态")=="✅" and d.get("右侧确认")=="✅" else "❌ 未形成")
             diag["止损参考"] = d.get("止损参考价","N/A")
-        else: diag["底分型"] = "❌ 未形成"; diag["止损参考"] = "N/A"
+            if d.get("止损参考价"):
+                diag["距止损"] = f"{(close - d['止损参考价']) / d['止损参考价'] * 100:.1f}%"
+            else:
+                diag["距止损"] = "N/A"
+        else:
+            diag["底分型"] = "❌ 未形成"; diag["止损参考"] = "N/A"; diag["距止损"] = "N/A"
         diag["缩量"] = f"{vr:.1%}"
         if close >= 40: diag["40元关口"] = "已突破"
         elif close >= 39: diag["40元关口"] = "正在测试"
@@ -391,7 +406,7 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
 
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3.1）")
+    print("  市场环境监控仪表盘（工程化校准版 v3.2）")
     print("="*60 + "\n")
     logger.info(f"开始运行监控，日期: {TODAY}")
     idx_df, market_turnover = get_index_data()
@@ -412,7 +427,7 @@ def run():
         level = "🟢" if final_score>=0.75 else ("🟡" if final_score>=0.55 else ("🟠" if final_score>=0.35 else "🔴"))
         print(f"  > 评分: {final_score:.3f} {level} | 策略: {diag.get('策略结论','N/A')}")
         print(f"  > 涨跌幅:{diag.get('涨跌幅','N/A')} | 量比:{diag.get('量比','N/A')} | 波动:{diag.get('波动','N/A')}\n")
-        row = {"标的":name,"角色":role,"综合评分":round(final_score,3),"涨跌幅":diag.get("涨跌幅","N/A"),"量比":diag.get("量比","N/A"),"趋势":diag.get("趋势","N/A"),"动量":diag.get("动量","N/A"),"波动":diag.get("波动","N/A"),"量能":diag.get("量能","N/A"),"策略结论":diag.get("策略结论","N/A")}
+        row = {"标的":name,"角色":role,"综合评分":round(final_score,3),"涨跌幅":diag.get("涨跌幅","N/A"),"量比":diag.get("量比","N/A"),"趋势":diag.get("趋势","N/A"),"动量":diag.get("动量","N/A"),"波动":diag.get("波动","N/A"),"量能":diag.get("量能","N/A"),"策略结论":diag.get("策略结论","N/A"),"距止损":diag.get("距止损","N/A")}
         for k,v in diag.items():
             if k not in row: row[k] = v
         summary_rows.append(row)
@@ -425,20 +440,29 @@ def run():
     elif env['综合评分'] >= 0.30: total_pos = "10-20%"
     else: total_pos = "≤10%"
 
-    # 每只标的的建议仓位
+    # 动态仓位分配：评分调整
     total_low = int(total_pos.split('-')[0].replace('%','').replace('≤','').strip())
+    total_high = int(total_pos.split('-')[-1].replace('%','').strip()) if '-' in total_pos and total_pos.split('-')[-1].replace('%','').strip().isdigit() else total_low
+    valid_scores = {name: max(scores.get(name, 0.5), 0.15) for name in scores}
+
     for row in summary_rows:
         name = row["标的"]
         w = monitor_stocks[name]["weight"]
-        stock_pos = f"{total_low * w:.0f}%"
+        s = valid_scores.get(name, 0.5)
+        if s >= 0.7: adj = 1.2
+        elif s < 0.4: adj = 0.7
+        else: adj = 1.0
+        dynamic_w = w * adj
+        stock_pos = f"{total_low * dynamic_w:.0f}%"
         row["建议个股仓位"] = stock_pos
+        row["评分调整"] = f"{adj:.1f}x"
 
     print("="*60)
     print(f"标的均分:{env['标的平均评分']:.3f} | 活跃度:{env['市场活跃度']:.3f} | {env['成交额描述']}")
     print(f"环境:{env['环境评级']} | 综合:{env['综合评分']:.3f}")
     print(f"总仓位建议: {total_pos}")
     for row in summary_rows:
-        print(f"  {row['标的']}: {row['建议个股仓位']}")
+        print(f"  {row['标的']}: {row['建议个股仓位']} (评分调整{row.get('评分调整','1.0x')})")
     print(f"建议:{env['建议']}")
     print("="*60)
 
