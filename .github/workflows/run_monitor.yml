@@ -2,9 +2,8 @@ name: 市场环境监控
 
 on:
   schedule:
-    # 北京时间每个交易日 15:30 运行（UTC 7:30）
     - cron: '30 7 * * 1-5'
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   monitor:
@@ -20,14 +19,20 @@ jobs:
         python-version: '3.12'
     
     - name: 安装依赖
-      run: |
-        pip install -r requirements.txt
+      run: pip install -r requirements.txt
     
     - name: 运行监控
       run: python market_monitor.py
     
-    - name: 上传报告
-      uses: actions/upload-artifact@v4
+    - name: 发送邮件
+      uses: dawidd6/action-send-mail@v4
       with:
-        name: 监控报告
-        path: 市场环境监控_*.xlsx
+        server_address: smtp.qq.com
+        server_port: 465
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: 市场环境监控报告-${{ github.run_id }}
+        to: ${{ secrets.MAIL_USERNAME }}
+        from: ${{ secrets.MAIL_USERNAME }}
+        body: 附件为今日市场环境监控报告，请查收。
+        attachments: 市场环境监控_*.xlsx
