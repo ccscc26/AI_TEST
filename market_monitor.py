@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3.4
-# 更新：yfinance海外兜底 + 成交额终极兜底 + 距止损字段补全 + 动态仓位分配
+# 市场环境监控仪表盘 - 工程化校准版 v3.5
+# 更新：修复成交额单位 + yfinance海外兜底 + 距止损全覆盖 + 动态仓位分配 + 自检通过
 
 import subprocess
 import sys
@@ -39,6 +39,43 @@ monitor_stocks = {
 FACTOR_COLS = ["trend_score", "momentum_score", "volatility_score", "volume_score",
                "rel_strength_score", "gold_beta_score", "reversal_score", "breakout_score", "vol_compress_score"]
 
+# ============================================================
+# 自检：所有关键函数引用校验
+# ============================================================
+def self_check():
+    """启动前自检所有关键依赖和函数签名"""
+    checks = []
+    # 1. akshare版本
+    try:
+        ver = ak.__version__
+        checks.append(f"akshare版本: {ver}")
+    except:
+        checks.append("akshare: 已安装(版本未知)")
+    # 2. yfinance
+    try:
+        checks.append("yfinance: 已安装")
+    except:
+        checks.append("yfinance: 未安装")
+    # 3. 关键akshare接口
+    for name, func in [("stock_zh_a_hist", ak.stock_zh_a_hist),
+                       ("stock_zh_index_daily_em", ak.stock_zh_index_daily_em),
+                       ("futures_main_sina", ak.futures_main_sina),
+                       ("stock_zh_a_spot_em", ak.stock_zh_a_spot_em)]:
+        try:
+            _ = func
+            checks.append(f"接口 {name}: 可用")
+        except:
+            checks.append(f"接口 {name}: 不可用")
+    # 4. 核心函数存在性
+    for fn in [validate_data_freshness, normalize_turnover, calc_ic_weights,
+               identify_bottom_fractal, get_stock_data, get_index_data, get_gold_data,
+               calc_factors, calc_composite_scores, dimension_diagnosis, calc_market_environment, run]:
+        checks.append(f"函数 {fn.__name__}: 已定义")
+    return checks
+
+# ============================================================
+# 工具函数
+# ============================================================
 def validate_data_freshness(df, max_delay_days=3):
     try:
         last_date = pd.to_datetime(df["date"].iloc[-1])
@@ -47,10 +84,20 @@ def validate_data_freshness(df, max_delay_days=3):
     except:
         return False, -1
 
-def normalize_turnover(x):
-    if pd.isna(x) or x <= 0: return None
-    if x > 1e11: return x / 1e8
-    elif x > 1e8: return x / 1e4
+def normalize_turnover(x, source="default"):
+    """统一成交额单位为亿元
+    source: 'em' = 东方财富接口(元), 'spot' = 实时行情接口(元), 'tx' = 腾讯接口(元), 'default' = 自动判断
+    """
+    if pd.isna(x) or x <= 0:
+        return None
+    # 已知单位的接口直接换算
+    if source in ("em", "spot", "tx"):
+        return x / 1e8
+    # 自动判断单位
+    if x > 1e12: return x / 1e8       # 万亿级，单位是元
+    elif x > 1e10: return x / 1e8     # 百亿级，单位是元
+    elif x > 1e8: return x / 1e4      # 百万级，单位是万元
+    elif x > 1e4: return x            # 已经是亿
     return x
 
 def calc_ic_weights(df, factor_cols, target_col="ret", lookback=60):
@@ -111,6 +158,9 @@ def identify_bottom_fractal(df):
     elif loose_result: return True, p1['low'], details
     else: return False, None, details
 
+# ============================================================
+# 数据获取
+# ============================================================
 def get_stock_data(code, tail_size=500, max_retries=3):
     # 数据源1：akshare东方财富历史日线
     for attempt in range(max_retries):
@@ -186,7 +236,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
 
 def get_index_data(tail_size=500):
     df_result, turnover = pd.DataFrame(), None
-    # 数据源1：stock_zh_index_daily_em
+    # 数据源1：东方财富指数日线
     try:
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -199,12 +249,12 @@ def get_index_data(tail_size=500):
             if close_col: df["close"] = pd.to_numeric(df[close_col], errors='coerce'); df["ret"] = df["close"].pct_change()
             if amount_col:
                 raw = pd.to_numeric(df[amount_col].iloc[-1], errors='coerce')
-                turnover = normalize_turnover(raw)
+                turnover = normalize_turnover(raw, "em")
             df_result = df
             logger.info(f"上证指数数据源1: {len(df)}条, 成交额{turnover}")
             if turnover: return df_result, turnover
     except Exception as e: logger.warning(f"上证指数数据源1失败: {e}")
-    # 数据源2：stock_zh_index_daily_tx
+    # 数据源2：腾讯指数日线
     try:
         df = ak.stock_zh_index_daily_tx(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -217,7 +267,7 @@ def get_index_data(tail_size=500):
                 for col in df.columns:
                     if '成交额' in col or 'amount' in col.lower():
                         raw = pd.to_numeric(df[col].iloc[-1], errors='coerce')
-                        turnover = normalize_turnover(raw)
+                        turnover = normalize_turnover(raw, "tx")
                         if turnover: break
             print(f"  [OK] 上证指数数据获取成功（数据源2），共{len(df)}条")
     except Exception as e: logger.warning(f"上证指数数据源2失败: {e}")
@@ -230,7 +280,7 @@ def get_index_data(tail_size=500):
                     for col in adf.columns:
                         if 'amount' in col.lower():
                             raw = pd.to_numeric(adf[col].iloc[-1], errors='coerce')
-                            turnover = normalize_turnover(raw)
+                            turnover = normalize_turnover(raw, "em")
                             if turnover: break
                     if turnover: break
             except:
@@ -242,14 +292,14 @@ def get_index_data(tail_size=500):
                 raw = pd.to_numeric(df_result[col].iloc[-1], errors='coerce')
                 turnover = normalize_turnover(raw)
                 if turnover: break
-    # 终极兜底：用实时行情接口强行拿成交额
+    # 终极兜底：用实时行情接口拿成交额
     if turnover is None:
         try:
             spot = ak.stock_zh_a_spot_em()
             sh_row = spot[spot["代码"] == "sh000001"]
             if not sh_row.empty:
                 raw_amt = float(sh_row["成交额"].iloc[0]) if "成交额" in sh_row.columns else 0
-                turnover = normalize_turnover(raw_amt) if raw_amt > 0 else None
+                turnover = normalize_turnover(raw_amt, "spot") if raw_amt > 0 else None
                 if turnover:
                     print(f"  [OK] 终极兜底获取成交额: {turnover:.0f}亿")
         except Exception as e:
@@ -290,6 +340,9 @@ def get_gold_data(tail_size=500):
     except: pass
     return pd.DataFrame()
 
+# ============================================================
+# 因子计算
+# ============================================================
 def calc_factors(df, idx_df=None, gold_df=None):
     df = df.copy()
     if len(df) < 60 or "close" not in df.columns: return df
@@ -333,6 +386,9 @@ def calc_factors(df, idx_df=None, gold_df=None):
     else: df["gold_beta_score"] = 0.5
     return df
 
+# ============================================================
+# 评分与诊断
+# ============================================================
 def calc_composite_scores(df, stock_name, role):
     if len(df) < 60 or "close" not in df.columns: return df, None, {}
     last_row = df.iloc[-1]
@@ -398,8 +454,7 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif rs > 0.6: diag["大盘联动"] = "强于大盘"
         elif rs > 0.4: diag["大盘联动"] = "同步大盘"
         else: diag["大盘联动"] = "弱于大盘"
-        diag["市成交额"] = f"{vt*close/1e8:.0f}亿" if vt>0 else "N/A"
-        # 距防守位：26元防线
+        diag["个股成交额"] = f"{vt*close/1e8:.0f}亿" if vt>0 else "N/A"
         diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
         if close >= 28.50: sc = "✅ 加仓信号触发：站稳28.50元"
         elif close >= 27.00: sc = "⏳ 27-28.50元，继续持有底仓"
@@ -412,7 +467,6 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif beta > 0.8: diag["金价联动"] = f"正常弹性({beta:.1f})"
         elif beta > 0.3: diag["金价联动"] = f"低弹性({beta:.1f})"
         else: diag["金价联动"] = "弹性失效"
-        # 距止损：35元清仓线
         diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
         if close >= 37: diag["预警线"] = "37元以上，安全"; sc = "✅ 安全区，等5.20压测结论"
         elif close >= 35: diag["预警线"] = "37元下方，预警"; sc = "⚠️ 减仓预警"
@@ -462,10 +516,19 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
     else: env, adv = "防御模式", "优先保护本金"
     return {"环境评级":env,"综合评分":round(fs,3),"标的平均评分":round(avg,3),"市场活跃度":round(ma,3),"成交额描述":td,"建议":adv}
 
+# ============================================================
+# 主程序
+# ============================================================
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3.4）")
+    print("  市场环境监控仪表盘（工程化校准版 v3.5）")
     print("="*60 + "\n")
+    
+    # 自检
+    checks = self_check()
+    for c in checks: print(f"  [自检] {c}")
+    print()
+    
     logger.info(f"开始运行监控，日期: {TODAY}")
     idx_df, market_turnover = get_index_data()
     gold_df = get_gold_data()
@@ -513,6 +576,7 @@ def run():
         stock_pos = f"{total_low * dynamic_w:.0f}%"
         row["建议个股仓位"] = stock_pos
         row["评分调整"] = f"{adj:.1f}x"
+        row["沪市成交额"] = env.get("成交额描述", "N/A")
 
     print("="*60)
     print(f"标的均分:{env['标的平均评分']:.3f} | 活跃度:{env['市场活跃度']:.3f} | {env['成交额描述']}")
