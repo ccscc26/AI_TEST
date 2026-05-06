@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3.3
-# 更新：修复成交额获取 + 终极兜底 + 距止损字段补全 + 评分调整显示
+# 市场环境监控仪表盘 - 工程化校准版 v3.4
+# 更新：yfinance海外兜底 + 成交额终极兜底 + 距止损字段补全 + 动态仓位分配
 
 import subprocess
 import sys
@@ -16,13 +16,14 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
-for pkg in ["akshare", "pandas", "numpy", "openpyxl"]:
+for pkg in ["akshare", "pandas", "numpy", "openpyxl", "yfinance"]:
     try:
         __import__(pkg)
     except:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 import akshare as ak
+import yfinance as yf
 
 # 北京时间
 utc_now = datetime.now(timezone.utc)
@@ -111,6 +112,7 @@ def identify_bottom_fractal(df):
     else: return False, None, details
 
 def get_stock_data(code, tail_size=500, max_retries=3):
+    # 数据源1：akshare东方财富历史日线
     for attempt in range(max_retries):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
@@ -126,6 +128,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
                 return df
         except:
             if attempt < max_retries - 1: time.sleep(2)
+    # 数据源2：akshare东方财富日线
     try:
         full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
         df = ak.stock_zh_a_daily(symbol=full_code, adjust="qfq")
@@ -143,6 +146,41 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             print(f"  [OK] 数据源2 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except: pass
+    # 数据源3：akshare腾讯历史日线
+    try:
+        df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date="20250101")
+        if df is not None and len(df) > 0:
+            df = df.tail(tail_size).copy()
+            df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True)
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            df["ret"] = df["close"].pct_change()
+            df = df.dropna(subset=["close"])
+            fresh, delta = validate_data_freshness(df)
+            if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
+            print(f"  [OK] 数据源3 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+            return df
+    except: pass
+    # 数据源4（海外兜底）：yfinance
+    try:
+        suffix = ".SS" if code.startswith("6") else ".SZ"
+        ticker = yf.Ticker(f"{code}{suffix}")
+        df = ticker.history(period="6mo")
+        if df is not None and len(df) > 0:
+            df = df.tail(tail_size).copy()
+            df.reset_index(inplace=True)
+            df.rename(columns={
+                "Date": "date", "Open": "open", "High": "high",
+                "Low": "low", "Close": "close", "Volume": "volume"
+            }, inplace=True)
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            df["ret"] = df["close"].pct_change()
+            df = df.dropna(subset=["close"])
+            fresh, delta = validate_data_freshness(df)
+            if not fresh: logger.warning(f"{code} yfinance数据可能过期: {delta}天")
+            print(f"  [OK] 数据源4(yfinance) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+            return df
+    except Exception as e:
+        logger.warning(f"yfinance兜底失败: {e}")
     logger.error(f"{code} 所有数据源均失败")
     return pd.DataFrame()
 
@@ -175,7 +213,6 @@ def get_index_data(tail_size=500):
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["ret"] = df["close"].pct_change()
             if df_result.empty: df_result = df
-            # 腾讯接口可能有成交额列
             if turnover is None:
                 for col in df.columns:
                     if '成交额' in col or 'amount' in col.lower():
@@ -363,10 +400,7 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         else: diag["大盘联动"] = "弱于大盘"
         diag["市成交额"] = f"{vt*close/1e8:.0f}亿" if vt>0 else "N/A"
         # 距防守位：26元防线
-        if close >= 26:
-            diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
-        else:
-            diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
+        diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
         if close >= 28.50: sc = "✅ 加仓信号触发：站稳28.50元"
         elif close >= 27.00: sc = "⏳ 27-28.50元，继续持有底仓"
         elif close >= 26.00: sc = "⏳ 26-27元，静默契约持有"
@@ -379,10 +413,7 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif beta > 0.3: diag["金价联动"] = f"低弹性({beta:.1f})"
         else: diag["金价联动"] = "弹性失效"
         # 距止损：35元清仓线
-        if close >= 35:
-            diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
-        else:
-            diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
+        diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
         if close >= 37: diag["预警线"] = "37元以上，安全"; sc = "✅ 安全区，等5.20压测结论"
         elif close >= 35: diag["预警线"] = "37元下方，预警"; sc = "⚠️ 减仓预警"
         else: diag["预警线"] = "35元下方，清仓危险"; sc = "🔴 清仓危险"
@@ -433,7 +464,7 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
 
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3.3）")
+    print("  市场环境监控仪表盘（工程化校准版 v3.4）")
     print("="*60 + "\n")
     logger.info(f"开始运行监控，日期: {TODAY}")
     idx_df, market_turnover = get_index_data()
