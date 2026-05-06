@@ -1,9 +1,10 @@
-# market_environment_monitor_final_v4.py
-# 市场环境监控仪表盘 - 最终完整版（修复成交额单位+市场活跃度分档）
+# market_monitor.py
+# 市场环境监控仪表盘 - GitHub Actions 自动运行版
 # 功能：输出五维综合评分 + 底分型自动识别，不生成任何买卖指令
 
 import subprocess
 import sys
+import os
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -118,6 +119,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
 
 def get_index_data(tail_size=500):
     """获取上证指数数据，返回 (df, 沪市成交额/亿元)"""
+    df_result = pd.DataFrame()
     turnover = None
 
     # 数据源1
@@ -125,11 +127,9 @@ def get_index_data(tail_size=500):
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
             df = df.tail(tail_size).copy()
-
             date_col = next((c for c in df.columns if 'date' in c.lower() or '日期' in c), df.columns[0])
             close_col = next((c for c in df.columns if 'close' in c.lower() or '收盘' in c), None)
             amount_col = next((c for c in df.columns if 'amount' in c.lower() or '成交额' in c), None)
-
             df.rename(columns={date_col: "date"}, inplace=True)
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             if close_col:
@@ -141,11 +141,15 @@ def get_index_data(tail_size=500):
                     turnover = raw_amount / 1e8
                 elif pd.notna(raw_amount) and raw_amount > 1e6:
                     turnover = raw_amount / 1e4
-                else:
-                    turnover = raw_amount if pd.notna(raw_amount) else None
-
-            print(f"  [OK] 上证指数数据获取成功（数据源1），共{len(df)}条，成交额{turnover:.0f}亿" if turnover else f"  [OK] 上证指数数据获取成功（数据源1），共{len(df)}条")
-            return df, turnover
+                elif pd.notna(raw_amount):
+                    turnover = raw_amount
+            df_result = df
+            print(f"  [OK] 上证指数数据获取成功（数据源1），共{len(df)}条", end="")
+            if turnover is not None and turnover > 0:
+                print(f"，成交额{turnover:.0f}亿")
+                return df_result, turnover
+            else:
+                print("，成交额未提取到，尝试其他方式...")
     except Exception as e:
         print(f"  [WARN] 上证指数数据源1失败: {str(e)[:50]}")
 
@@ -157,38 +161,60 @@ def get_index_data(tail_size=500):
             df.rename(columns={"收盘": "close", "日期": "date"}, inplace=True)
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["ret"] = df["close"].pct_change()
+            if df_result.empty:
+                df_result = df
             print(f"  [OK] 上证指数数据获取成功（数据源2），共{len(df)}条")
-            return df, turnover
     except Exception as e:
         print(f"  [WARN] 上证指数数据源2失败: {str(e)[:50]}")
 
-    # 兜底方案
-    if turnover is None:
-        try:
-            amount_df = ak.stock_zh_index_daily(symbol="sh000001")
-            if amount_df is not None and len(amount_df) > 0:
-                for col in amount_df.columns:
-                    col_lower = col.lower()
-                    if 'amount' in col_lower or '成交额' in col_lower or 'turnover' in col_lower:
-                        raw_amount = amount_df[col].iloc[-1]
-                        if raw_amount > 1e10:
-                            turnover = raw_amount / 1e8
-                        elif raw_amount > 1e6:
-                            turnover = raw_amount / 1e4
-                        else:
-                            turnover = raw_amount
-                        print(f"  [OK] 兜底方案获取成交额: {turnover:.0f}亿")
+    # 兜底方案1：重新调用数据源1接口获取成交额（带重试）
+    if turnover is None or turnover == 0:
+        for attempt in range(3):
+            try:
+                amount_df = ak.stock_zh_index_daily_em(symbol="sh000001")
+                if amount_df is not None and len(amount_df) > 0:
+                    for col in amount_df.columns:
+                        col_lower = col.lower()
+                        if 'amount' in col_lower:
+                            raw_amount = pd.to_numeric(amount_df[col].iloc[-1], errors='coerce')
+                            if pd.notna(raw_amount) and raw_amount > 1e10:
+                                turnover = raw_amount / 1e8
+                            elif pd.notna(raw_amount) and raw_amount > 1e6:
+                                turnover = raw_amount / 1e4
+                            elif pd.notna(raw_amount):
+                                turnover = raw_amount
+                            if turnover is not None and turnover > 0:
+                                print(f"  [OK] 兜底方案获取成交额: {turnover:.0f}亿 (第{attempt+1}次)")
+                                break
+                    if turnover is not None and turnover > 0:
                         break
-        except Exception as e:
-            print(f"  [WARN] 兜底方案失败: {str(e)[:50]}")
+            except:
+                if attempt < 2:
+                    time.sleep(2)
+
+    # 兜底方案2：从已获取的df中再次尝试提取
+    if (turnover is None or turnover == 0) and not df_result.empty:
+        try:
+            for col in df_result.columns:
+                if 'amount' in col.lower():
+                    raw = pd.to_numeric(df_result[col].iloc[-1], errors='coerce')
+                    if pd.notna(raw) and raw > 1e10:
+                        turnover = raw / 1e8
+                        print(f"  [OK] 兜底方案2提取成交额: {turnover:.0f}亿")
+                        break
+        except:
+            pass
 
     if turnover is not None and turnover > 0:
         print(f"  [INFO] 最终成交额: {turnover:.0f}亿")
     else:
         print(f"  [INFO] 成交额未获取到，市场活跃度将使用默认值0.5")
 
-    print(f"  [FAIL] 上证指数所有数据源均失败")
-    return pd.DataFrame(), turnover
+    if not df_result.empty:
+        return df_result, turnover
+    else:
+        print(f"  [FAIL] 上证指数所有数据源均失败")
+        return pd.DataFrame(), None
 
 
 def get_gold_data(tail_size=500):
@@ -537,7 +563,7 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
 
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（最终完整版 v4）")
+    print("  市场环境监控仪表盘（GitHub Actions 自动运行版）")
     print("  ⚠️  本工具仅输出环境评分，不生成任何买卖指令")
     print("  ⚠️  所有仓位决策请遵循已校准的策略参数")
     print("="*60 + "\n")
@@ -637,16 +663,16 @@ def run():
         export_df["成交额描述"] = env.get("成交额描述", "")
         export_df["市场环境"] = env["环境评级"]
         export_df["市场评分"] = env["综合评分"]
-        
-        # GitHub Actions环境输出到仓库根目录，本地环境输出到当前目录
-import os
-if os.environ.get('GITHUB_ACTIONS') == 'true':
-    output_dir = os.environ.get('GITHUB_WORKSPACE', '.')
-    file = os.path.join(output_dir, f"市场环境监控_{today}.xlsx")
-else:
-    file = f"市场环境监控_{today}.xlsx"
-export_df.to_excel(file, index=False)
-print(f"\n[完成] 监控报告已生成: {file}")
+
+        # GitHub Actions环境输出到仓库根目录
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            output_dir = os.environ.get('GITHUB_WORKSPACE', '.')
+            file = os.path.join(output_dir, f"市场环境监控_{today}.xlsx")
+        else:
+            file = f"市场环境监控_{today}.xlsx"
+
+        export_df.to_excel(file, index=False)
+        print(f"\n[完成] 监控报告已生成: {file}")
     except:
         print(f"\n[提示] Excel导出失败，请查看上方汇总数据")
 
@@ -667,9 +693,8 @@ if __name__ == "__main__":
         traceback.print_exc()
 
     # GitHub Actions环境不需要等待输入
-import os
-if os.environ.get('GITHUB_ACTIONS') != 'true':
-    print("\n按回车键退出...")
-    input()
-else:
-    print("\n[GitHub Actions] 运行完成")
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        print("\n按回车键退出...")
+        input()
+    else:
+        print("\n[GitHub Actions] 运行完成")
