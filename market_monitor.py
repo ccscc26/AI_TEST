@@ -1,6 +1,6 @@
 # market_monitor.py
 # 市场环境监控仪表盘 - GitHub Actions 自动运行版
-# 功能：输出五维综合评分 + 底分型自动识别，不生成任何买卖指令
+# 功能：输出五维综合评分 + 底分型自动识别 + 策略触发结论
 
 import subprocess
 import sys
@@ -122,7 +122,6 @@ def get_index_data(tail_size=500):
     df_result = pd.DataFrame()
     turnover = None
 
-    # 数据源1
     try:
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -153,7 +152,6 @@ def get_index_data(tail_size=500):
     except Exception as e:
         print(f"  [WARN] 上证指数数据源1失败: {str(e)[:50]}")
 
-    # 数据源2
     try:
         df = ak.stock_zh_index_daily_tx(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -167,7 +165,6 @@ def get_index_data(tail_size=500):
     except Exception as e:
         print(f"  [WARN] 上证指数数据源2失败: {str(e)[:50]}")
 
-    # 兜底方案1：重新调用数据源1接口获取成交额（带重试）
     if turnover is None or turnover == 0:
         for attempt in range(3):
             try:
@@ -192,7 +189,6 @@ def get_index_data(tail_size=500):
                 if attempt < 2:
                     time.sleep(2)
 
-    # 兜底方案2：从已获取的df中再次尝试提取
     if (turnover is None or turnover == 0) and not df_result.empty:
         try:
             for col in df_result.columns:
@@ -378,16 +374,38 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
     prev_5 = df.iloc[-6:-1] if len(df) > 5 else df.iloc[:-1]
     prev_20 = df.iloc[-21:-1] if len(df) > 20 else df.iloc[:-1]
 
+    # ---------- 基础诊断 ----------
     trend = "向上" if last.get("trend_score", 0.5) > 0.7 else "震荡" if last.get("trend_score", 0.5) > 0.4 else "偏弱"
     momentum = "强劲" if last.get("momentum_score", 0.5) > 0.7 else "温和" if last.get("momentum_score", 0.5) > 0.4 else "衰减"
-    volume_label = "放量" if last.get("volume_score", 0.5) > 0.7 else "正常" if last.get("volume_score", 0.5) > 0.4 else "缩量"
 
-    vol_score = last.get("volatility_score", 0.5)
+    # 量比（当日成交量 / 5日均量）
+    vol_today = last.get("volume", 0)
+    vol_ma5_val = prev_5["volume"].mean() if len(prev_5) > 0 and "volume" in prev_5.columns else vol_today
+    vol_ratio = vol_today / vol_ma5_val if vol_ma5_val > 0 else 1.0
+    if vol_ratio > 1.5:
+        volume_label = f"放量({vol_ratio:.1f}x)"
+    elif vol_ratio > 0.7:
+        volume_label = f"正常({vol_ratio:.1f}x)"
+    else:
+        volume_label = f"缩量({vol_ratio:.1f}x)"
+
+    # 当日涨跌幅
     ret_today = last.get("ret", 0)
     if pd.isna(ret_today):
         ret_today = 0
+    ret_display = f"{ret_today:+.2%}"
 
-    if vol_score < 0.4 and ret_today > 0:
+    # ---------- 波动率诊断（含当日极端涨跌即时修正）----------
+    vol_score = last.get("volatility_score", 0.5)
+
+    if abs(ret_today) > 0.07:
+        volatility = "剧烈波动"
+    elif abs(ret_today) > 0.04:
+        if ret_today > 0:
+            volatility = "大幅上涨"
+        else:
+            volatility = "大幅下跌"
+    elif vol_score < 0.4 and ret_today > 0:
         volatility = "强势波动"
     elif vol_score < 0.4 and ret_today < 0:
         volatility = "异常波动"
@@ -396,7 +414,19 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
     else:
         volatility = "正常"
 
-    diag = {"标的": stock_name, "趋势": trend, "动量": momentum, "波动": volatility, "量能": volume_label}
+    diag = {
+        "标的": stock_name,
+        "收盘价": f"{last.get('close', 0):.2f}",
+        "涨跌幅": ret_display,
+        "量比": f"{vol_ratio:.1f}x",
+        "趋势": trend,
+        "动量": momentum,
+        "波动": volatility,
+        "量能": volume_label,
+    }
+
+    # ---------- 角色专属诊断 + 策略触发结论 ----------
+    strategy_conclusion = None
 
     if role == "压舱石_望远镜":
         bias = last.get("bias_60", 0)
@@ -418,35 +448,42 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         else:
             diag["大盘联动"] = "弱于大盘"
 
-        vol_today = last.get("volume", 0)
-        vol_ma20 = prev_20["volume"].mean() if len(prev_20) > 0 and "volume" in prev_20.columns else 0
-        if vol_today > vol_ma20 * 1.3:
-            diag["成交额"] = "显著放量"
-        elif vol_today > vol_ma20 * 0.7:
-            diag["成交额"] = "正常"
+        diag["市成交额"] = f"{vol_today * last.get('close', 0) / 1e8:.0f}亿" if vol_today > 0 and last.get('close', 0) > 0 else "N/A"
+
+        # 策略触发结论
+        close = last.get("close", 0)
+        if close >= 28.50:
+            strategy_conclusion = "✅ 加仓信号触发：站稳28.50元，可按计划加仓"
+        elif close >= 27.00:
+            strategy_conclusion = "⏳ 观察中：27-28.50元区间，继续持有底仓等待"
+        elif close >= 26.00:
+            strategy_conclusion = "⏳ 观察中：26-27元区间，静默契约持有"
         else:
-            diag["成交额"] = "缩量"
+            strategy_conclusion = "⚠️ 预警：跌破26元，需重新评估逻辑"
 
     elif role == "避险矛_显微镜":
         beta = last.get("gold_beta", 0)
         if pd.isna(beta) or beta == 0 or 'gold_ret' not in df.columns:
             diag["金价联动"] = "数据缺失"
         elif beta > 1.2:
-            diag["金价联动"] = "高弹性"
+            diag["金价联动"] = f"高弹性({beta:.1f})"
         elif beta > 0.8:
-            diag["金价联动"] = "正常弹性"
+            diag["金价联动"] = f"正常弹性({beta:.1f})"
         elif beta > 0.3:
-            diag["金价联动"] = "低弹性"
+            diag["金价联动"] = f"低弹性({beta:.1f})"
         else:
             diag["金价联动"] = "弹性失效"
 
         close = last.get("close", 0)
         if close >= 37:
             diag["预警线"] = "37元以上，安全"
+            strategy_conclusion = "✅ 安全区：37元上方，按压测计划继续观察"
         elif close >= 35:
             diag["预警线"] = "37元下方，预警"
+            strategy_conclusion = "⚠️ 预警区：37元下方，减仓预警，等5.20压测结论"
         else:
             diag["预警线"] = "35元下方，清仓危险"
+            strategy_conclusion = "🔴 清仓危险：跌破35元，按纪律清仓"
 
     elif role == "弹性牌_信号灯":
         if bottom_info and bottom_info.get("details"):
@@ -463,13 +500,7 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
             diag["底分型"] = "❌ 未形成"
             diag["止损参考"] = "N/A"
 
-        vol_today = last.get("volume", 0)
-        vol_ma5 = prev_5["volume"].mean() if len(prev_5) > 0 and "volume" in prev_5.columns else vol_today
-        if vol_ma5 > 0:
-            vol_ratio = vol_today / vol_ma5
-            diag["缩量"] = f"{vol_ratio:.1%}"
-        else:
-            diag["缩量"] = "数据不足"
+        diag["缩量"] = f"{vol_ratio:.1%}"
 
         close = last.get("close", 0)
         if close >= 40:
@@ -481,6 +512,19 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         else:
             diag["40元关口"] = "弱势，等待支撑"
 
+        # 策略触发结论
+        is_bottom = bottom_info.get("is_bottom", False)
+        if is_bottom:
+            stop_price = bottom_info.get("stop_loss", "N/A")
+            strategy_conclusion = f"✅ 底分型确认：可按计划建仓10-15%，止损参考{stop_price}"
+        elif vol_ratio < 0.7 and close <= 37:
+            strategy_conclusion = "⏳ 缩量回踩中：继续等底分型确认信号"
+        elif vol_ratio >= 1.0:
+            strategy_conclusion = "⏳ 量能未缩：短线博弈还在，继续等待"
+        else:
+            strategy_conclusion = "⏳ 观察中：等待缩量底分型确认后再动手"
+
+    diag["策略结论"] = strategy_conclusion
     return diag
 
 
@@ -590,6 +634,7 @@ def run():
             print(f"  > 数据获取失败\n")
             summary_rows.append({
                 "标的": name, "角色": role, "综合评分": "数据缺失",
+                "涨跌幅": "N/A", "量比": "N/A",
                 "趋势": "N/A", "动量": "N/A", "波动": "N/A", "量能": "N/A"
             })
             continue
@@ -621,8 +666,9 @@ def run():
 
         print(f"  > 综合评分: {final_score:.3f} ({level})")
         print(f"  > {note}")
+        print(f"  > 策略结论: {diag.get('策略结论', 'N/A')}")
 
-        diag_items = [f"{k}:{v}" for k, v in diag.items() if k not in ["标的"]]
+        diag_items = [f"{k}:{v}" for k, v in diag.items() if k not in ["标的", "策略结论"]]
         print(f"  > " + " | ".join(diag_items) + "\n")
 
         row = {
@@ -630,13 +676,16 @@ def run():
             "角色": role,
             "综合评分": round(final_score, 3),
             "评分区间": level.split(' ')[0],
+            "涨跌幅": diag.get("涨跌幅", "N/A"),
+            "量比": diag.get("量比", "N/A"),
             "趋势": diag.get("趋势", "N/A"),
             "动量": diag.get("动量", "N/A"),
             "波动": diag.get("波动", "N/A"),
             "量能": diag.get("量能", "N/A"),
+            "策略结论": diag.get("策略结论", "N/A"),
         }
         for k, v in diag.items():
-            if k not in ["标的", "趋势", "动量", "波动", "量能"]:
+            if k not in ["标的", "涨跌幅", "量比", "趋势", "动量", "波动", "量能", "策略结论", "角色"]:
                 row[k] = v
 
         summary_rows.append(row)
@@ -664,7 +713,6 @@ def run():
         export_df["市场环境"] = env["环境评级"]
         export_df["市场评分"] = env["综合评分"]
 
-        # GitHub Actions环境输出到仓库根目录
         if os.environ.get('GITHUB_ACTIONS') == 'true':
             output_dir = os.environ.get('GITHUB_WORKSPACE', '.')
             file = os.path.join(output_dir, f"市场环境监控_{today}.xlsx")
@@ -692,7 +740,6 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
 
-    # GitHub Actions环境不需要等待输入
     if os.environ.get('GITHUB_ACTIONS') != 'true':
         print("\n按回车键退出...")
         input()
