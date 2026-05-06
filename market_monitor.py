@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3.2
-# 更新：动态仓位分配 + 止损距离显示 + 防断流兜底 + 自检通过
+# 市场环境监控仪表盘 - 工程化校准版 v3.3
+# 更新：修复成交额获取 + 终极兜底 + 距止损字段补全 + 评分调整显示
 
 import subprocess
 import sys
@@ -76,32 +76,25 @@ def identify_bottom_fractal(df):
     if len(df) < 5: return False, None, {}
     recent = df.tail(5)
     p2, p1, p0 = recent.iloc[-3], recent.iloc[-2], recent.iloc[-1]
-
-    # 包含关系校验：p1被p2完全包含，向前多取一根
     if p1['high'] <= p2['high'] and p1['low'] >= p2['low'] and len(df) >= 6:
         p2 = df.iloc[-4]
         p1 = df.iloc[-3]
         p0 = df.iloc[-2]
-
     if "ma20" in df.columns and "ma60" in df.columns and len(df) >= 5:
         if df["ma20"].iloc[-3] >= df["ma60"].iloc[-3]:
             return False, None, {"底分型形态": "❌(非下降趋势)", "止损参考价": None, "今日量比": 1.0}
-
     is_bottom_shape = (p1['low'] < p2['low'] and p1['low'] < p0['low'] and
                        p1['high'] < p2['high'] and p1['high'] < p0['high'])
     is_confirmed = p0['close'] > p1['high']
-
     vol_min_10 = df['volume'].rolling(10).min().iloc[-1]
     vol_ma5 = df['volume'].rolling(5).mean().iloc[-1]
     vol_today = df['volume'].iloc[-1]
     is_low_volume_strict = p1['volume'] <= vol_min_10 * 1.2
     is_low_volume_normal = p1['volume'] < vol_ma5 * 0.8
     vol_ratio = vol_today / vol_ma5 if vol_ma5 > 0 else 1.0
-
     p0_body = abs(p0['close'] - p0['open'])
     p0_range = p0['high'] - p0['low'] if p0['high'] > p0['low'] else 0.01
     is_solid_candle = p0_body / p0_range > 0.3
-
     details = {
         "底分型形态": "✅" if is_bottom_shape else "❌",
         "右侧确认": "✅" if is_confirmed else "❌",
@@ -111,10 +104,8 @@ def identify_bottom_fractal(df):
         "止损参考价": round(p1['low'], 2) if is_bottom_shape else None,
         "今日量比": round(vol_ratio, 2)
     }
-
     strict_result = is_bottom_shape and is_confirmed and is_low_volume_strict and is_solid_candle
     loose_result = is_bottom_shape and is_confirmed and is_low_volume_normal
-
     if strict_result: return True, p1['low'], details
     elif loose_result: return True, p1['low'], details
     else: return False, None, details
@@ -157,6 +148,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
 
 def get_index_data(tail_size=500):
     df_result, turnover = pd.DataFrame(), None
+    # 数据源1：stock_zh_index_daily_em
     try:
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -174,6 +166,7 @@ def get_index_data(tail_size=500):
             logger.info(f"上证指数数据源1: {len(df)}条, 成交额{turnover}")
             if turnover: return df_result, turnover
     except Exception as e: logger.warning(f"上证指数数据源1失败: {e}")
+    # 数据源2：stock_zh_index_daily_tx
     try:
         df = ak.stock_zh_index_daily_tx(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -182,7 +175,16 @@ def get_index_data(tail_size=500):
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["ret"] = df["close"].pct_change()
             if df_result.empty: df_result = df
+            # 腾讯接口可能有成交额列
+            if turnover is None:
+                for col in df.columns:
+                    if '成交额' in col or 'amount' in col.lower():
+                        raw = pd.to_numeric(df[col].iloc[-1], errors='coerce')
+                        turnover = normalize_turnover(raw)
+                        if turnover: break
+            print(f"  [OK] 上证指数数据获取成功（数据源2），共{len(df)}条")
     except Exception as e: logger.warning(f"上证指数数据源2失败: {e}")
+    # 兜底方案：重试数据源1获取成交额
     if not turnover:
         for attempt in range(3):
             try:
@@ -196,16 +198,29 @@ def get_index_data(tail_size=500):
                     if turnover: break
             except:
                 if attempt < 2: time.sleep(2)
-    # 最终兜底：用实时行情接口强行补齐
-    if df_result.empty or turnover is None:
+    # 从df_result中再次尝试提取
+    if not turnover and not df_result.empty:
+        for col in df_result.columns:
+            if 'amount' in col.lower() or '成交额' in col:
+                raw = pd.to_numeric(df_result[col].iloc[-1], errors='coerce')
+                turnover = normalize_turnover(raw)
+                if turnover: break
+    # 终极兜底：用实时行情接口强行拿成交额
+    if turnover is None:
         try:
             spot = ak.stock_zh_a_spot_em()
             sh_row = spot[spot["代码"] == "sh000001"]
             if not sh_row.empty:
-                df_result = pd.DataFrame([{"date": TODAY, "close": float(sh_row["最新价"].iloc[0]), "ret": 0.0}])
                 raw_amt = float(sh_row["成交额"].iloc[0]) if "成交额" in sh_row.columns else 0
                 turnover = normalize_turnover(raw_amt) if raw_amt > 0 else None
-        except: pass
+                if turnover:
+                    print(f"  [OK] 终极兜底获取成交额: {turnover:.0f}亿")
+        except Exception as e:
+            logger.warning(f"终极兜底失败: {e}")
+    if turnover:
+        print(f"  [INFO] 最终成交额: {turnover:.0f}亿")
+    else:
+        print(f"  [INFO] 成交额未获取到，市场活跃度将使用默认值0.5")
     if not df_result.empty: return df_result, turnover
     else: return pd.DataFrame(), None
 
@@ -347,6 +362,11 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif rs > 0.4: diag["大盘联动"] = "同步大盘"
         else: diag["大盘联动"] = "弱于大盘"
         diag["市成交额"] = f"{vt*close/1e8:.0f}亿" if vt>0 else "N/A"
+        # 距防守位：26元防线
+        if close >= 26:
+            diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
+        else:
+            diag["距止损"] = f"{(close - 26) / 26 * 100:.1f}%"
         if close >= 28.50: sc = "✅ 加仓信号触发：站稳28.50元"
         elif close >= 27.00: sc = "⏳ 27-28.50元，继续持有底仓"
         elif close >= 26.00: sc = "⏳ 26-27元，静默契约持有"
@@ -358,6 +378,11 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif beta > 0.8: diag["金价联动"] = f"正常弹性({beta:.1f})"
         elif beta > 0.3: diag["金价联动"] = f"低弹性({beta:.1f})"
         else: diag["金价联动"] = "弹性失效"
+        # 距止损：35元清仓线
+        if close >= 35:
+            diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
+        else:
+            diag["距止损"] = f"{(close - 35) / 35 * 100:.1f}%"
         if close >= 37: diag["预警线"] = "37元以上，安全"; sc = "✅ 安全区，等5.20压测结论"
         elif close >= 35: diag["预警线"] = "37元下方，预警"; sc = "⚠️ 减仓预警"
         else: diag["预警线"] = "35元下方，清仓危险"; sc = "🔴 清仓危险"
@@ -382,6 +407,8 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
         elif vr < 0.7 and close <= 37: sc = "⏳ 缩量回踩中"
         elif vr >= 1.0: sc = "⏳ 量能未缩，继续等"
         else: sc = "⏳ 等待底分型信号"
+    if "距止损" not in diag:
+        diag["距止损"] = "N/A"
     diag["策略结论"] = sc
     return diag
 
@@ -406,7 +433,7 @@ def calc_market_environment(scores_dict, diagnoses, turnover=None):
 
 def run():
     print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3.2）")
+    print("  市场环境监控仪表盘（工程化校准版 v3.3）")
     print("="*60 + "\n")
     logger.info(f"开始运行监控，日期: {TODAY}")
     idx_df, market_turnover = get_index_data()
@@ -426,7 +453,8 @@ def run():
         diagnoses.append(diag)
         level = "🟢" if final_score>=0.75 else ("🟡" if final_score>=0.55 else ("🟠" if final_score>=0.35 else "🔴"))
         print(f"  > 评分: {final_score:.3f} {level} | 策略: {diag.get('策略结论','N/A')}")
-        print(f"  > 涨跌幅:{diag.get('涨跌幅','N/A')} | 量比:{diag.get('量比','N/A')} | 波动:{diag.get('波动','N/A')}\n")
+        print(f"  > 涨跌幅:{diag.get('涨跌幅','N/A')} | 量比:{diag.get('量比','N/A')} | 波动:{diag.get('波动','N/A')}")
+        print(f"  > 距止损:{diag.get('距止损','N/A')}\n")
         row = {"标的":name,"角色":role,"综合评分":round(final_score,3),"涨跌幅":diag.get("涨跌幅","N/A"),"量比":diag.get("量比","N/A"),"趋势":diag.get("趋势","N/A"),"动量":diag.get("动量","N/A"),"波动":diag.get("波动","N/A"),"量能":diag.get("量能","N/A"),"策略结论":diag.get("策略结论","N/A"),"距止损":diag.get("距止损","N/A")}
         for k,v in diag.items():
             if k not in row: row[k] = v
@@ -440,11 +468,9 @@ def run():
     elif env['综合评分'] >= 0.30: total_pos = "10-20%"
     else: total_pos = "≤10%"
 
-    # 动态仓位分配：评分调整
+    # 动态仓位分配
     total_low = int(total_pos.split('-')[0].replace('%','').replace('≤','').strip())
-    total_high = int(total_pos.split('-')[-1].replace('%','').strip()) if '-' in total_pos and total_pos.split('-')[-1].replace('%','').strip().isdigit() else total_low
     valid_scores = {name: max(scores.get(name, 0.5), 0.15) for name in scores}
-
     for row in summary_rows:
         name = row["标的"]
         w = monitor_stocks[name]["weight"]
@@ -462,7 +488,7 @@ def run():
     print(f"环境:{env['环境评级']} | 综合:{env['综合评分']:.3f}")
     print(f"总仓位建议: {total_pos}")
     for row in summary_rows:
-        print(f"  {row['标的']}: {row['建议个股仓位']} (评分调整{row.get('评分调整','1.0x')})")
+        print(f"  {row['标的']}: {row['建议个股仓位']} (评分调整{row.get('评分调整','1.0x')}, 距止损{row.get('距止损','N/A')})")
     print(f"建议:{env['建议']}")
     print("="*60)
 
