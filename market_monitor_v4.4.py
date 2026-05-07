@@ -404,11 +404,11 @@ def calc_factors(df, idx_df=None, gold_df=None):
     if len(df) < 60 or "close" not in df.columns:
         return df
     
-    # yfinance成交量修正
+    # yfinance成交量修正（手转股）
     if "source" in df.columns and df["source"].iloc[-1] == "yf":
         df["volume"] = df["volume"] * 100
     
-    # 基础指标
+    # 基础指标计算
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma60"] = df["close"].rolling(60).mean()
     df["bias_60"] = (df["close"] - df["ma60"]) / df["ma60"]
@@ -417,13 +417,25 @@ def calc_factors(df, idx_df=None, gold_df=None):
     trend_direction = (df["ma20"] > df["ma60"]).astype(float)
     df["trend_score"] = (trend_direction * (1 - abs(df["bias_60"].clip(-0.3, 0.3)) * 0.5)).fillna(0.5).clip(0, 1)
     
-    # 动量因子（v4.4修正版：排名+绝对值）
+    # ================= 动量因子（v4.4 修正版） =================
+    # 短期动量（5日）
     mom_5 = df["close"].pct_change(5)
+    # 中期动量（20日）
     mom_20 = df["close"].pct_change(20)
+    # 长期动量（60日）
     mom_60 = df["close"].pct_change(60)
+    
+    # 加权综合动量
     momentum_raw = mom_5 * 0.4 + mom_20 * 0.35 + mom_60 * 0.25
+    
+    # 动量排名（60日滚动百分位）
     df["momentum_rank"] = momentum_raw.rolling(60).rank(pct=True).fillna(0.5)
+    
+    # 动量绝对值（用于判断实际涨跌幅）
     df["momentum_value"] = momentum_raw.fillna(0)
+    
+    # 综合动量评分：排名60%权重 + 标准化绝对值40%权重
+    # 将实际动量映射到0-1区间（假设涨跌±20%为极端值）
     mom_abs_score = (df["momentum_value"].clip(-0.2, 0.2) + 0.2) / 0.4
     df["momentum_score"] = (df["momentum_rank"] * 0.6 + mom_abs_score * 0.4).clip(0, 1)
     
@@ -444,7 +456,7 @@ def calc_factors(df, idx_df=None, gold_df=None):
     vol_ratio = df["ret"].rolling(10).std() / (df["ret"].rolling(60).std() + 1e-9)
     df["vol_compress_score"] = 1 - vol_ratio.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 相对强弱因子
+    # 相对强弱因子（与大盘比较）
     if idx_df is not None and not idx_df.empty:
         idx = idx_df[['date', 'ret']].rename(columns={'ret': 'idx_ret'}).copy()
         idx["date"] = pd.to_datetime(idx["date"]).dt.strftime("%Y-%m-%d")
@@ -470,70 +482,70 @@ def calc_factors(df, idx_df=None, gold_df=None):
     return df
 
 def calc_composite_scores(df, stock_name, role):
-    """计算综合评分"""
+    """计算综合评分（v4.4 适配新动量因子）"""
     if len(df) < 60 or "close" not in df.columns:
         return df, None, {}
-    
     close = df.iloc[-1].get("close", 0)
     bottom_info = {}
-    
     if role == "弹性牌_信号灯":
         is_b, sl, det = identify_bottom_fractal(df)
         bottom_info = {"is_bottom": is_b, "stop_loss": sl, "details": det}
-    
     if role == "避险矛_显微镜" and close < 35.0:
         df["composite_score"] = 0.15
         return df, 0.15, bottom_info
-    
     available_factors = [c for c in FACTOR_COLS if c in df.columns]
     if len(available_factors) < 3:
         df["composite_score"] = 0.5
         return df, 0.5, bottom_info
-    
     weights = calc_ic_weights(df, available_factors, "ret", 60)
-    
     if role == "弹性牌_信号灯" and bottom_info.get("is_bottom"):
         if "vol_compress_score" in weights:
             weights["vol_compress_score"] = min(weights["vol_compress_score"] * 2, 0.5)
-    
     t = sum(weights.values()) + 1e-6
     weights = {k: v/t for k, v in weights.items()}
-    
     score = sum(df[c].iloc[-1] * weights.get(c, 0) 
                for c in available_factors 
                if c in df.columns and pd.notna(df[c].iloc[-1]))
     score = max(0, min(1, score))
-    
     if role == "弹性牌_信号灯" and bottom_info.get("is_bottom"):
         score += 0.2
     if "volume_score" in df.columns and pd.notna(df["volume_score"].iloc[-1]) and df["volume_score"].iloc[-1] < 0.7:
         score += 0.1
-    
     df["composite_score"] = min(score, 1.0)
     return df, df["composite_score"].iloc[-1], bottom_info
 
 # ================= 诊断与环境层 =================
 def dimension_diagnosis(df, name, role, b_info=None):
-    """多维度诊断分析（v4.4）"""
+    """多维度诊断分析（v4.4 修正动量和波动诊断）"""
     if len(df) < 5:
         return {}
     
     last = df.iloc[-1]
     close = last.get("close", 0)
     
+    # 计算关键指标
     prev5 = df.iloc[-6:-1] if len(df) > 5 else df.iloc[:-1]
     vm = prev5["volume"].mean() if "volume" in prev5.columns else last.get("volume", 1)
     vr = last.get("volume", 0) / vm if vm > 0 else 1.0
     rt = last.get("ret", 0) or 0
     vs = last.get("volatility_score", 0.5)
     
-    # 波动诊断（v4.3）
+    # ================= 波动诊断（v4.3 修正版） =================
     if abs(rt) > 0.07:
-        vol_label = "剧烈上涨" if rt > 0 else "剧烈下跌"
+        if rt > 0:
+            vol_label = "剧烈上涨"
+        else:
+            vol_label = "剧烈下跌"
     elif abs(rt) > 0.04:
-        vol_label = "大幅上涨" if rt > 0 else "大幅下跌"
+        if rt > 0:
+            vol_label = "大幅上涨"
+        else:
+            vol_label = "大幅下跌"
     elif abs(rt) > 0.02:
-        vol_label = "显著上涨" if rt > 0 else "显著下跌"
+        if rt > 0:
+            vol_label = "显著上涨"
+        else:
+            vol_label = "显著下跌"
     elif vs < 0.4:
         if rt > 0:
             vol_label = "高波偏强"
@@ -542,7 +554,10 @@ def dimension_diagnosis(df, name, role, b_info=None):
         else:
             vol_label = "高波震荡"
     elif vs > 0.6:
-        vol_label = "极致平稳" if abs(rt) < 0.005 else "小幅波动"
+        if abs(rt) < 0.005:
+            vol_label = "极致平稳"
+        else:
+            vol_label = "小幅波动"
     else:
         if rt > 0.01:
             vol_label = "温和上涨"
@@ -551,7 +566,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
         else:
             vol_label = "横盘整理"
     
-    # 动量诊断（v4.4）
+    # ================= 动量诊断（v4.4 修正版） =================
     mom_rank = last.get("momentum_rank", 0.5)
     mom_value = last.get("momentum_value", 0)
     
@@ -576,6 +591,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
     else:
         mom_label = "底部盘整"
     
+    # ================= 基础诊断 =================
     # 趋势
     trend_score = last.get("trend_score", 0.5)
     if trend_score > 0.7:
@@ -606,7 +622,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
     
     sc = None
     
-    # 角色特定诊断
+    # ================= 角色特定诊断 =================
     if role == "压舱石_望远镜":
         bias = last.get("bias_60", 0)
         if bias > 0.2:
