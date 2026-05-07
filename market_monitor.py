@@ -147,53 +147,7 @@ def identify_bottom_fractal(df):
     else: return False, None, details
 
 def get_stock_data(code, tail_size=500, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-            if df is not None and len(df) > 0:
-                df = df.tail(tail_size).copy()
-                df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True)
-                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-                df["ret"] = df["close"].pct_change()
-                df = df.dropna(subset=["close"])
-                fresh, delta = validate_data_freshness(df)
-                if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
-                print(f"  [OK] 数据源1 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
-                return df
-        except:
-            if attempt < max_retries - 1: time.sleep(2)
-    try:
-        full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
-        df = ak.stock_zh_a_daily(symbol=full_code, adjust="qfq")
-        if df is not None and len(df) > 0:
-            df = df.tail(tail_size).copy()
-            df.rename(columns={"close":"close","open":"open","high":"high","low":"low","volume":"volume","date":"date"}, inplace=True, errors='ignore')
-            for col in ["close","open","high","low","volume"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=["close"])
-            df["ret"] = df["close"].pct_change()
-            if "date" not in df.columns: df["date"] = pd.date_range(end=datetime.now(), periods=len(df), freq='B').strftime("%Y-%m-%d")
-            else: df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-            fresh, delta = validate_data_freshness(df)
-            if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
-            print(f"  [OK] 数据源2 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
-            return df
-    except: pass
-    try:
-        start_date = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date=start_date)
-        if df is not None and len(df) > 0:
-            df = df.tail(tail_size).copy()
-            df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True, errors='ignore')
-            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-            df["ret"] = df["close"].pct_change()
-            df = df.dropna(subset=["close"])
-            fresh, delta = validate_data_freshness(df)
-            if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
-            print(f"  [OK] 数据源3 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
-            return df
-    except: pass
+    # 数据源1（优选）：yfinance 海外最稳定
     try:
         suffix = ".SS" if code.startswith("6") else ".SZ"
         ticker = yf.Ticker(f"{code}{suffix}")
@@ -211,10 +165,65 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             df["source"] = "yf"
             fresh, delta = validate_data_freshness(df)
             if not fresh: logger.warning(f"{code} yfinance数据可能过期: {delta}天")
-            print(f"  [OK] 数据源4(yfinance) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+            print(f"  [OK] 数据源1(yfinance) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except Exception as e:
-        logger.warning(f"yfinance兜底失败: {e}")
+        logger.warning(f"yfinance失败: {e}，降级到数据源2")
+
+    # 数据源2：腾讯历史日线
+    try:
+        start_date = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date=start_date)
+        if df is not None and len(df) > 0:
+            df = df.tail(tail_size).copy()
+            df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True, errors='ignore')
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            df["ret"] = df["close"].pct_change()
+            df = df.dropna(subset=["close"])
+            fresh, delta = validate_data_freshness(df)
+            if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
+            print(f"  [OK] 数据源2(腾讯) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+            return df
+    except:
+        logger.warning("腾讯接口失败，降级到数据源3")
+
+    # 数据源3：东方财富历史日线
+    for attempt in range(max_retries):
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+            if df is not None and len(df) > 0:
+                df = df.tail(tail_size).copy()
+                df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True)
+                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+                df["ret"] = df["close"].pct_change()
+                df = df.dropna(subset=["close"])
+                fresh, delta = validate_data_freshness(df)
+                if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
+                print(f"  [OK] 数据源3(东方财富) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+                return df
+        except:
+            if attempt < max_retries - 1: time.sleep(2)
+
+    # 数据源4：东方财富日线
+    try:
+        full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
+        df = ak.stock_zh_a_daily(symbol=full_code, adjust="qfq")
+        if df is not None and len(df) > 0:
+            df = df.tail(tail_size).copy()
+            df.rename(columns={"close":"close","open":"open","high":"high","low":"low","volume":"volume","date":"date"}, inplace=True, errors='ignore')
+            for col in ["close","open","high","low","volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            df = df.dropna(subset=["close"])
+            df["ret"] = df["close"].pct_change()
+            if "date" not in df.columns: df["date"] = pd.date_range(end=datetime.now(), periods=len(df), freq='B').strftime("%Y-%m-%d")
+            else: df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            fresh, delta = validate_data_freshness(df)
+            if not fresh: logger.warning(f"{code} 数据可能过期: {delta}天")
+            print(f"  [OK] 数据源4(东方财富日线) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
+            return df
+    except: pass
+
     logger.error(f"{code} 所有数据源均失败")
     return pd.DataFrame()
 
