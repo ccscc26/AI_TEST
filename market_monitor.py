@@ -1,6 +1,6 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - 工程化校准版 v3.5
-# 更新：修复成交额单位 + yfinance海外兜底 + 距止损全覆盖 + 动态仓位分配 + 自检通过
+# 市场环境监控仪表盘 - 工程化校准版 v3.6
+# 更新：修复OHLC缺失 + 黄金日期伪造 + 指数代码匹配 + 动态日期 + yfinance单位标记
 
 import subprocess
 import sys
@@ -39,24 +39,17 @@ monitor_stocks = {
 FACTOR_COLS = ["trend_score", "momentum_score", "volatility_score", "volume_score",
                "rel_strength_score", "gold_beta_score", "reversal_score", "breakout_score", "vol_compress_score"]
 
-# ============================================================
-# 自检：所有关键函数引用校验
-# ============================================================
 def self_check():
-    """启动前自检所有关键依赖和函数签名"""
     checks = []
-    # 1. akshare版本
     try:
         ver = ak.__version__
         checks.append(f"akshare版本: {ver}")
     except:
         checks.append("akshare: 已安装(版本未知)")
-    # 2. yfinance
     try:
         checks.append("yfinance: 已安装")
     except:
         checks.append("yfinance: 未安装")
-    # 3. 关键akshare接口
     for name, func in [("stock_zh_a_hist", ak.stock_zh_a_hist),
                        ("stock_zh_index_daily_em", ak.stock_zh_index_daily_em),
                        ("futures_main_sina", ak.futures_main_sina),
@@ -66,16 +59,12 @@ def self_check():
             checks.append(f"接口 {name}: 可用")
         except:
             checks.append(f"接口 {name}: 不可用")
-    # 4. 核心函数存在性
     for fn in [validate_data_freshness, normalize_turnover, calc_ic_weights,
                identify_bottom_fractal, get_stock_data, get_index_data, get_gold_data,
                calc_factors, calc_composite_scores, dimension_diagnosis, calc_market_environment, run]:
         checks.append(f"函数 {fn.__name__}: 已定义")
     return checks
 
-# ============================================================
-# 工具函数
-# ============================================================
 def validate_data_freshness(df, max_delay_days=3):
     try:
         last_date = pd.to_datetime(df["date"].iloc[-1])
@@ -85,23 +74,19 @@ def validate_data_freshness(df, max_delay_days=3):
         return False, -1
 
 def normalize_turnover(x, source="default"):
-    """统一成交额单位为亿元
-    source: 'em' = 东方财富接口(元), 'spot' = 实时行情接口(元), 'tx' = 腾讯接口(元), 'default' = 自动判断
-    """
     if pd.isna(x) or x <= 0:
         return None
-    # 已知单位的接口直接换算
     if source in ("em", "spot", "tx"):
         return x / 1e8
-    # 自动判断单位
-    if x > 1e12: return x / 1e8       # 万亿级，单位是元
-    elif x > 1e10: return x / 1e8     # 百亿级，单位是元
-    elif x > 1e8: return x / 1e4      # 百万级，单位是万元
-    elif x > 1e4: return x            # 已经是亿
+    if source == "default":
+        logger.warning("成交额单位自动推断，可能存在偏差")
+    if x > 1e12: return x / 1e8
+    elif x > 1e10: return x / 1e8
+    elif x > 1e8: return x / 1e4
+    elif x > 1e4: return x
     return x
 
 def calc_ic_weights(df, factor_cols, target_col="ret", lookback=60):
-    """Rank IC 权重计算"""
     ic_dict = {}
     recent = df.tail(lookback)
     for col in factor_cols:
@@ -122,6 +107,9 @@ def calc_ic_weights(df, factor_cols, target_col="ret", lookback=60):
 def identify_bottom_fractal(df):
     df = df.copy()
     if len(df) < 5: return False, None, {}
+    required_cols = ["open","high","low","close","volume"]
+    if any(c not in df.columns for c in required_cols):
+        return False, None, {"底分型形态": "❌(数据缺失)", "止损参考价": None, "今日量比": 1.0}
     recent = df.tail(5)
     p2, p1, p0 = recent.iloc[-3], recent.iloc[-2], recent.iloc[-1]
     if p1['high'] <= p2['high'] and p1['low'] >= p2['low'] and len(df) >= 6:
@@ -158,11 +146,8 @@ def identify_bottom_fractal(df):
     elif loose_result: return True, p1['low'], details
     else: return False, None, details
 
-# ============================================================
-# 数据获取
-# ============================================================
 def get_stock_data(code, tail_size=500, max_retries=3):
-    # 数据源1：akshare东方财富历史日线
+    # 数据源1
     for attempt in range(max_retries):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
@@ -178,15 +163,16 @@ def get_stock_data(code, tail_size=500, max_retries=3):
                 return df
         except:
             if attempt < max_retries - 1: time.sleep(2)
-    # 数据源2：akshare东方财富日线
+    # 数据源2
     try:
         full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
         df = ak.stock_zh_a_daily(symbol=full_code, adjust="qfq")
         if df is not None and len(df) > 0:
             df = df.tail(tail_size).copy()
-            df.rename(columns={"close":"close","volume":"volume","date":"date"}, inplace=True)
-            df["close"] = pd.to_numeric(df["close"], errors='coerce')
-            df["volume"] = pd.to_numeric(df["volume"], errors='coerce')
+            df.rename(columns={"close":"close","open":"open","high":"high","low":"low","volume":"volume","date":"date"}, inplace=True, errors='ignore')
+            for col in ["close","open","high","low","volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
             df = df.dropna(subset=["close"])
             df["ret"] = df["close"].pct_change()
             if "date" not in df.columns: df["date"] = pd.date_range(end=datetime.now(), periods=len(df), freq='B').strftime("%Y-%m-%d")
@@ -196,12 +182,13 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             print(f"  [OK] 数据源2 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except: pass
-    # 数据源3：akshare腾讯历史日线
+    # 数据源3
     try:
-        df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date="20250101")
+        start_date = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
+        df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date=start_date)
         if df is not None and len(df) > 0:
             df = df.tail(tail_size).copy()
-            df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True)
+            df.rename(columns={"收盘":"close","开盘":"open","最高":"high","最低":"low","成交量":"volume","日期":"date"}, inplace=True, errors='ignore')
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["ret"] = df["close"].pct_change()
             df = df.dropna(subset=["close"])
@@ -210,11 +197,11 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             print(f"  [OK] 数据源3 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except: pass
-    # 数据源4（海外兜底）：yfinance
+    # 数据源4（海外兜底）
     try:
         suffix = ".SS" if code.startswith("6") else ".SZ"
         ticker = yf.Ticker(f"{code}{suffix}")
-        df = ticker.history(period="6mo")
+        df = ticker.history(period="6mo", timeout=10)
         if df is not None and len(df) > 0:
             df = df.tail(tail_size).copy()
             df.reset_index(inplace=True)
@@ -225,6 +212,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["ret"] = df["close"].pct_change()
             df = df.dropna(subset=["close"])
+            df["source"] = "yf"
             fresh, delta = validate_data_freshness(df)
             if not fresh: logger.warning(f"{code} yfinance数据可能过期: {delta}天")
             print(f"  [OK] 数据源4(yfinance) 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
@@ -236,7 +224,7 @@ def get_stock_data(code, tail_size=500, max_retries=3):
 
 def get_index_data(tail_size=500):
     df_result, turnover = pd.DataFrame(), None
-    # 数据源1：东方财富指数日线
+    # 数据源1
     try:
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -254,7 +242,7 @@ def get_index_data(tail_size=500):
             logger.info(f"上证指数数据源1: {len(df)}条, 成交额{turnover}")
             if turnover: return df_result, turnover
     except Exception as e: logger.warning(f"上证指数数据源1失败: {e}")
-    # 数据源2：腾讯指数日线
+    # 数据源2
     try:
         df = ak.stock_zh_index_daily_tx(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -271,7 +259,7 @@ def get_index_data(tail_size=500):
                         if turnover: break
             print(f"  [OK] 上证指数数据获取成功（数据源2），共{len(df)}条")
     except Exception as e: logger.warning(f"上证指数数据源2失败: {e}")
-    # 兜底方案：重试数据源1获取成交额
+    # 兜底重试
     if not turnover:
         for attempt in range(3):
             try:
@@ -285,27 +273,37 @@ def get_index_data(tail_size=500):
                     if turnover: break
             except:
                 if attempt < 2: time.sleep(2)
-    # 从df_result中再次尝试提取
+    # df_result提取
     if not turnover and not df_result.empty:
         for col in df_result.columns:
             if 'amount' in col.lower() or '成交额' in col:
                 raw = pd.to_numeric(df_result[col].iloc[-1], errors='coerce')
                 turnover = normalize_turnover(raw)
                 if turnover: break
-    # 终极兜底：用实时行情接口拿成交额
+    # 终极兜底：实时行情
     if turnover is None:
-        try:
-            spot = ak.stock_zh_a_spot_em()
-            sh_row = spot[spot["代码"] == "sh000001"]
-            if not sh_row.empty:
-                raw_amt = float(sh_row["成交额"].iloc[0]) if "成交额" in sh_row.columns else 0
-                turnover = normalize_turnover(raw_amt, "spot") if raw_amt > 0 else None
-                if turnover:
-                    print(f"  [OK] 终极兜底获取成交额: {turnover:.0f}亿")
-        except Exception as e:
-            logger.warning(f"终极兜底失败: {e}")
+        for spot_func in [ak.stock_zh_a_spot_em, ak.stock_zh_index_spot_em]:
+            try:
+                spot = spot_func()
+                if spot is not None and not spot.empty:
+                    sh_row = spot[spot.iloc[:,0].astype(str).str.contains("000001|上证指数")]
+                    if sh_row.empty:
+                        sh_row = spot[spot.iloc[:,0].astype(str).str.contains("1A0001")]
+                    if not sh_row.empty:
+                        for col in sh_row.columns:
+                            if '成交额' in col:
+                                raw_amt = float(sh_row[col].iloc[0])
+                                turnover = normalize_turnover(raw_amt, "spot") if raw_amt > 0 else None
+                                if turnover: break
+                if turnover: break
+            except:
+                continue
     if turnover:
-        print(f"  [INFO] 最终成交额: {turnover:.0f}亿")
+        hour = beijing_now.hour
+        if hour < 15:
+            print(f"  [INFO] 最终成交额: {turnover:.0f}亿(盘中预估)")
+        else:
+            print(f"  [INFO] 最终成交额: {turnover:.0f}亿")
     else:
         print(f"  [INFO] 成交额未获取到，市场活跃度将使用默认值0.5")
     if not df_result.empty: return df_result, turnover
@@ -330,22 +328,26 @@ def get_gold_data(tail_size=500):
         df = ak.spot_gold()
         if df is not None and len(df) > 0:
             df = df.tail(tail_size).copy()
-            df.rename(columns={"价格":"close","日期":"date"}, inplace=True)
-            if "date" not in df.columns: df["date"] = pd.date_range(end=datetime.now(), periods=len(df), freq='B').strftime("%Y-%m-%d")
-            else: df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            df.rename(columns={"价格":"close"}, inplace=True)
+            if "日期" in df.columns:
+                df.rename(columns={"日期":"date"}, inplace=True)
+                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            else:
+                return pd.DataFrame()
             df["close"] = pd.to_numeric(df["close"], errors='coerce')
             df["ret"] = df["close"].pct_change()
-            df = df.dropna(subset=["close"])
+            df = df.dropna(subset=["close","date"])
             return df
     except: pass
     return pd.DataFrame()
 
-# ============================================================
-# 因子计算
-# ============================================================
 def calc_factors(df, idx_df=None, gold_df=None):
     df = df.copy()
     if len(df) < 60 or "close" not in df.columns: return df
+    required_cols = ["open","high","low","close","volume","date"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        logger.warning(f"缺失列 {missing}，部分因子将使用默认值")
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma60"] = df["close"].rolling(60).mean()
     td = (df["ma20"] > df["ma60"]).astype(float).fillna(0.5)
@@ -355,6 +357,8 @@ def calc_factors(df, idx_df=None, gold_df=None):
     df["momentum_score"] = mom.rolling(60).rank(pct=True).fillna(0.5)
     vol = df["ret"].rolling(20).std()
     df["volatility_score"] = 1 - vol.rolling(60).rank(pct=True).fillna(0.5)
+    if "source" in df.columns and df["source"].iloc[-1] == "yf":
+        df["volume"] = df["volume"] * 100
     df["volume_score"] = (df["volume"] / df["volume"].rolling(20).mean()).clip(0.3, 2.0).fillna(1.0)
     df["reversal"] = -df["ret"].rolling(5).sum()
     df["reversal_score"] = df["reversal"].rolling(60).rank(pct=True).fillna(0.5)
@@ -386,9 +390,6 @@ def calc_factors(df, idx_df=None, gold_df=None):
     else: df["gold_beta_score"] = 0.5
     return df
 
-# ============================================================
-# 评分与诊断
-# ============================================================
 def calc_composite_scores(df, stock_name, role):
     if len(df) < 60 or "close" not in df.columns: return df, None, {}
     last_row = df.iloc[-1]
@@ -500,114 +501,4 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
 def calc_market_environment(scores_dict, diagnoses, turnover=None):
     if not scores_dict: return {"环境评级":"数据缺失","综合评分":0.0,"标的平均评分":0.0,"市场活跃度":0.0,"成交额描述":"数据缺失","建议":"等待数据"}
     avg = np.mean(list(scores_dict.values()))
-    ma, td = 0.5, "数据缺失"
-    if turnover and turnover > 0:
-        if turnover >= 15000: ma, td = 1.0, f"沪市{turnover:.0f}亿，极为活跃"
-        elif turnover >= 12000: ma, td = 0.9, f"沪市{turnover:.0f}亿，高度活跃"
-        elif turnover >= 10000: ma, td = 0.8, f"沪市{turnover:.0f}亿，活跃"
-        elif turnover >= 7500: ma, td = 0.6, f"沪市{turnover:.0f}亿，正常偏暖"
-        elif turnover >= 5000: ma, td = 0.4, f"沪市{turnover:.0f}亿，偏冷"
-        else: ma, td = 0.2, f"沪市{turnover:.0f}亿，极冷"
-    fs = avg * 0.5 + ma * 0.5
-    if fs >= 0.75: env, adv = "牛市级", "确认信号后可适当积极"
-    elif fs >= 0.60: env, adv = "强势震荡", "市场偏暖，留意加仓信号"
-    elif fs >= 0.45: env, adv = "中性整理", "严格按信号操作"
-    elif fs >= 0.30: env, adv = "弱势承压", "注意防守"
-    else: env, adv = "防御模式", "优先保护本金"
-    return {"环境评级":env,"综合评分":round(fs,3),"标的平均评分":round(avg,3),"市场活跃度":round(ma,3),"成交额描述":td,"建议":adv}
-
-# ============================================================
-# 主程序
-# ============================================================
-def run():
-    print("\n" + "="*60)
-    print("  市场环境监控仪表盘（工程化校准版 v3.5）")
-    print("="*60 + "\n")
-    
-    # 自检
-    checks = self_check()
-    for c in checks: print(f"  [自检] {c}")
-    print()
-    
-    logger.info(f"开始运行监控，日期: {TODAY}")
-    idx_df, market_turnover = get_index_data()
-    gold_df = get_gold_data()
-    scores, diagnoses, summary_rows = {}, [], []
-    for name, info in monitor_stocks.items():
-        code, role = info["code"], info["role"]
-        print(f"[监控] {name} ({code}) - {role}")
-        df = get_stock_data(code, tail_size=500)
-        if df.empty: continue
-        print(f"  > 数据量: {len(df)} 条，收盘: {df['close'].iloc[-1]:.2f}")
-        df = calc_factors(df, idx_df, gold_df)
-        df, final_score, bottom_info = calc_composite_scores(df, name, role)
-        if final_score is None: final_score = 0.5
-        scores[name] = final_score
-        diag = dimension_diagnosis(df, name, role, bottom_info)
-        diagnoses.append(diag)
-        level = "🟢" if final_score>=0.75 else ("🟡" if final_score>=0.55 else ("🟠" if final_score>=0.35 else "🔴"))
-        print(f"  > 评分: {final_score:.3f} {level} | 策略: {diag.get('策略结论','N/A')}")
-        print(f"  > 涨跌幅:{diag.get('涨跌幅','N/A')} | 量比:{diag.get('量比','N/A')} | 波动:{diag.get('波动','N/A')}")
-        print(f"  > 距止损:{diag.get('距止损','N/A')}\n")
-        row = {"标的":name,"角色":role,"综合评分":round(final_score,3),"涨跌幅":diag.get("涨跌幅","N/A"),"量比":diag.get("量比","N/A"),"趋势":diag.get("趋势","N/A"),"动量":diag.get("动量","N/A"),"波动":diag.get("波动","N/A"),"量能":diag.get("量能","N/A"),"策略结论":diag.get("策略结论","N/A"),"距止损":diag.get("距止损","N/A")}
-        for k,v in diag.items():
-            if k not in row: row[k] = v
-        summary_rows.append(row)
-    env = calc_market_environment(scores, diagnoses, market_turnover)
-
-    # 总仓位建议
-    if env['综合评分'] >= 0.75: total_pos = "60-80%"
-    elif env['综合评分'] >= 0.60: total_pos = "40-60%"
-    elif env['综合评分'] >= 0.45: total_pos = "20-40%"
-    elif env['综合评分'] >= 0.30: total_pos = "10-20%"
-    else: total_pos = "≤10%"
-
-    # 动态仓位分配
-    total_low = int(total_pos.split('-')[0].replace('%','').replace('≤','').strip())
-    valid_scores = {name: max(scores.get(name, 0.5), 0.15) for name in scores}
-    for row in summary_rows:
-        name = row["标的"]
-        w = monitor_stocks[name]["weight"]
-        s = valid_scores.get(name, 0.5)
-        if s >= 0.7: adj = 1.2
-        elif s < 0.4: adj = 0.7
-        else: adj = 1.0
-        dynamic_w = w * adj
-        stock_pos = f"{total_low * dynamic_w:.0f}%"
-        row["建议个股仓位"] = stock_pos
-        row["评分调整"] = f"{adj:.1f}x"
-        row["沪市成交额"] = env.get("成交额描述", "N/A")
-
-    print("="*60)
-    print(f"标的均分:{env['标的平均评分']:.3f} | 活跃度:{env['市场活跃度']:.3f} | {env['成交额描述']}")
-    print(f"环境:{env['环境评级']} | 综合:{env['综合评分']:.3f}")
-    print(f"总仓位建议: {total_pos}")
-    for row in summary_rows:
-        print(f"  {row['标的']}: {row['建议个股仓位']} (评分调整{row.get('评分调整','1.0x')}, 距止损{row.get('距止损','N/A')})")
-    print(f"建议:{env['建议']}")
-    print("="*60)
-
-    try:
-        export_df = pd.DataFrame(summary_rows)
-        export_df["日期"] = TODAY
-        export_df["总仓位建议"] = total_pos
-        export_df["标的平均评分"] = env["标的平均评分"]
-        export_df["市场活跃度"] = env["市场活跃度"]
-        export_df["成交额描述"] = env.get("成交额描述","")
-        export_df["市场环境"] = env["环境评级"]
-        export_df["市场评分"] = env["综合评分"]
-        if os.environ.get('GITHUB_ACTIONS') == 'true':
-            file = os.path.join(os.environ.get('GITHUB_WORKSPACE','.'), f"市场环境监控_{TODAY}.xlsx")
-        else:
-            file = f"市场环境监控_{TODAY}.xlsx"
-        export_df.to_excel(file, index=False)
-        print(f"\n[完成] {file}")
-    except: pass
-    return {"scores":scores,"env":env,"diagnosis":{d["标的"]:d for d in diagnoses}}
-
-if __name__ == "__main__":
-    try: run()
-    except Exception as e: logger.error(f"运行出错: {e}", exc_info=True)
-    if os.environ.get('GITHUB_ACTIONS') != 'true':
-        print("\n按回车键退出...")
-        input()
+    ma, td = 0.5, "数据
