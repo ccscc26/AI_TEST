@@ -22,7 +22,7 @@ jobs:
       run: pip install -r requirements.txt
     
     - name: 运行监控
-      run: python market_monitor.py
+      run: python market_monitor_v4.4.py
     
     - name: 发送邮件
       uses: dawidd6/action-send-mail@v4
