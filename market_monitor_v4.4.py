@@ -592,14 +592,27 @@ def dimension_diagnosis(df, name, role, b_info=None):
         mom_label = "底部盘整"
     
     # ================= 基础诊断 =================
-    # 趋势
-    trend_score = last.get("trend_score", 0.5)
-    if trend_score > 0.7:
-        trend_label = "多头排列"
-    elif trend_score > 0.4:
-        trend_label = "均线缠绕"
+    # ================= 趋势诊断（v4.5 修正版） =================
+    ma20 = last.get("ma20", 0)
+    ma60 = last.get("ma60", 0)
+    bias = last.get("bias_60", 0)
+    
+    if ma20 > ma60:
+        if bias > 0.15:
+            trend_label = "多头强势"
+        elif bias > 0.05:
+            trend_label = "多头排列"
+        else:
+            trend_label = "多头初期"
+    elif ma20 < ma60:
+        if bias < -0.15:
+            trend_label = "空头强势"
+        elif bias < -0.05:
+            trend_label = "空头排列"
+        else:
+            trend_label = "空头尾声"
     else:
-        trend_label = "空头排列"
+        trend_label = "均线粘合"
     
     # 量能
     if vr > 1.5:
