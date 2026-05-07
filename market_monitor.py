@@ -147,7 +147,6 @@ def identify_bottom_fractal(df):
     else: return False, None, details
 
 def get_stock_data(code, tail_size=500, max_retries=3):
-    # 数据源1
     for attempt in range(max_retries):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
@@ -163,7 +162,6 @@ def get_stock_data(code, tail_size=500, max_retries=3):
                 return df
         except:
             if attempt < max_retries - 1: time.sleep(2)
-    # 数据源2
     try:
         full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
         df = ak.stock_zh_a_daily(symbol=full_code, adjust="qfq")
@@ -182,7 +180,6 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             print(f"  [OK] 数据源2 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except: pass
-    # 数据源3
     try:
         start_date = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
         df = ak.stock_zh_a_hist_tx(symbol=code, period="daily", start_date=start_date)
@@ -197,7 +194,6 @@ def get_stock_data(code, tail_size=500, max_retries=3):
             print(f"  [OK] 数据源3 成功获取 {code}，共{len(df)}条，最新日期{df['date'].iloc[-1]}")
             return df
     except: pass
-    # 数据源4（海外兜底）
     try:
         suffix = ".SS" if code.startswith("6") else ".SZ"
         ticker = yf.Ticker(f"{code}{suffix}")
@@ -224,7 +220,6 @@ def get_stock_data(code, tail_size=500, max_retries=3):
 
 def get_index_data(tail_size=500):
     df_result, turnover = pd.DataFrame(), None
-    # 数据源1
     try:
         df = ak.stock_zh_index_daily_em(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -242,7 +237,6 @@ def get_index_data(tail_size=500):
             logger.info(f"上证指数数据源1: {len(df)}条, 成交额{turnover}")
             if turnover: return df_result, turnover
     except Exception as e: logger.warning(f"上证指数数据源1失败: {e}")
-    # 数据源2
     try:
         df = ak.stock_zh_index_daily_tx(symbol="sh000001")
         if df is not None and len(df) > 0:
@@ -259,7 +253,6 @@ def get_index_data(tail_size=500):
                         if turnover: break
             print(f"  [OK] 上证指数数据获取成功（数据源2），共{len(df)}条")
     except Exception as e: logger.warning(f"上证指数数据源2失败: {e}")
-    # 兜底重试
     if not turnover:
         for attempt in range(3):
             try:
@@ -273,14 +266,12 @@ def get_index_data(tail_size=500):
                     if turnover: break
             except:
                 if attempt < 2: time.sleep(2)
-    # df_result提取
     if not turnover and not df_result.empty:
         for col in df_result.columns:
             if 'amount' in col.lower() or '成交额' in col:
                 raw = pd.to_numeric(df_result[col].iloc[-1], errors='coerce')
                 turnover = normalize_turnover(raw)
                 if turnover: break
-    # 终极兜底：实时行情
     if turnover is None:
         for spot_func in [ak.stock_zh_a_spot_em, ak.stock_zh_index_spot_em]:
             try:
@@ -501,4 +492,102 @@ def dimension_diagnosis(df, stock_name, role, bottom_info=None):
 def calc_market_environment(scores_dict, diagnoses, turnover=None):
     if not scores_dict: return {"环境评级":"数据缺失","综合评分":0.0,"标的平均评分":0.0,"市场活跃度":0.0,"成交额描述":"数据缺失","建议":"等待数据"}
     avg = np.mean(list(scores_dict.values()))
-    ma, td = 0.5, "数据
+    ma, td = 0.5, "数据缺失"
+    if turnover and turnover > 0:
+        if turnover >= 15000: ma, td = 1.0, f"沪市{turnover:.0f}亿，极为活跃"
+        elif turnover >= 12000: ma, td = 0.9, f"沪市{turnover:.0f}亿，高度活跃"
+        elif turnover >= 10000: ma, td = 0.8, f"沪市{turnover:.0f}亿，活跃"
+        elif turnover >= 7500: ma, td = 0.6, f"沪市{turnover:.0f}亿，正常偏暖"
+        elif turnover >= 5000: ma, td = 0.4, f"沪市{turnover:.0f}亿，偏冷"
+        else: ma, td = 0.2, f"沪市{turnover:.0f}亿，极冷"
+    fs = avg * 0.5 + ma * 0.5
+    if fs >= 0.75: env, adv = "牛市级", "确认信号后可适当积极"
+    elif fs >= 0.60: env, adv = "强势震荡", "市场偏暖，留意加仓信号"
+    elif fs >= 0.45: env, adv = "中性整理", "严格按信号操作"
+    elif fs >= 0.30: env, adv = "弱势承压", "注意防守"
+    else: env, adv = "防御模式", "优先保护本金"
+    return {"环境评级":env,"综合评分":round(fs,3),"标的平均评分":round(avg,3),"市场活跃度":round(ma,3),"成交额描述":td,"建议":adv}
+
+def run():
+    print("\n" + "="*60)
+    print("  市场环境监控仪表盘（工程化校准版 v3.6）")
+    print("="*60 + "\n")
+    checks = self_check()
+    for c in checks: print(f"  [自检] {c}")
+    print()
+    logger.info(f"开始运行监控，日期: {TODAY}")
+    idx_df, market_turnover = get_index_data()
+    gold_df = get_gold_data()
+    scores, diagnoses, summary_rows = {}, [], []
+    for name, info in monitor_stocks.items():
+        code, role = info["code"], info["role"]
+        print(f"[监控] {name} ({code}) - {role}")
+        df = get_stock_data(code, tail_size=500)
+        if df.empty: continue
+        print(f"  > 数据量: {len(df)} 条，收盘: {df['close'].iloc[-1]:.2f}")
+        df = calc_factors(df, idx_df, gold_df)
+        df, final_score, bottom_info = calc_composite_scores(df, name, role)
+        if final_score is None: final_score = 0.5
+        scores[name] = final_score
+        diag = dimension_diagnosis(df, name, role, bottom_info)
+        diagnoses.append(diag)
+        level = "🟢" if final_score>=0.75 else ("🟡" if final_score>=0.55 else ("🟠" if final_score>=0.35 else "🔴"))
+        print(f"  > 评分: {final_score:.3f} {level} | 策略: {diag.get('策略结论','N/A')}")
+        print(f"  > 涨跌幅:{diag.get('涨跌幅','N/A')} | 量比:{diag.get('量比','N/A')} | 波动:{diag.get('波动','N/A')}")
+        print(f"  > 距止损:{diag.get('距止损','N/A')}\n")
+        row = {"标的":name,"角色":role,"综合评分":round(final_score,3),"涨跌幅":diag.get("涨跌幅","N/A"),"量比":diag.get("量比","N/A"),"趋势":diag.get("趋势","N/A"),"动量":diag.get("动量","N/A"),"波动":diag.get("波动","N/A"),"量能":diag.get("量能","N/A"),"策略结论":diag.get("策略结论","N/A"),"距止损":diag.get("距止损","N/A")}
+        for k,v in diag.items():
+            if k not in row: row[k] = v
+        summary_rows.append(row)
+    env = calc_market_environment(scores, diagnoses, market_turnover)
+    if env['综合评分'] >= 0.75: total_pos = "60-80%"
+    elif env['综合评分'] >= 0.60: total_pos = "40-60%"
+    elif env['综合评分'] >= 0.45: total_pos = "20-40%"
+    elif env['综合评分'] >= 0.30: total_pos = "10-20%"
+    else: total_pos = "≤10%"
+    total_low = int(total_pos.split('-')[0].replace('%','').replace('≤','').strip())
+    valid_scores = {name: max(scores.get(name, 0.5), 0.15) for name in scores}
+    for row in summary_rows:
+        name = row["标的"]
+        w = monitor_stocks[name]["weight"]
+        s = valid_scores.get(name, 0.5)
+        if s >= 0.7: adj = 1.2
+        elif s < 0.4: adj = 0.7
+        else: adj = 1.0
+        dynamic_w = w * adj
+        stock_pos = f"{total_low * dynamic_w:.0f}%"
+        row["建议个股仓位"] = stock_pos
+        row["评分调整"] = f"{adj:.1f}x"
+        row["沪市成交额"] = env.get("成交额描述", "N/A")
+    print("="*60)
+    print(f"标的均分:{env['标的平均评分']:.3f} | 活跃度:{env['市场活跃度']:.3f} | {env['成交额描述']}")
+    print(f"环境:{env['环境评级']} | 综合:{env['综合评分']:.3f}")
+    print(f"总仓位建议: {total_pos}")
+    for row in summary_rows:
+        print(f"  {row['标的']}: {row['建议个股仓位']} (评分调整{row.get('评分调整','1.0x')}, 距止损{row.get('距止损','N/A')})")
+    print(f"建议:{env['建议']}")
+    print("="*60)
+    try:
+        export_df = pd.DataFrame(summary_rows)
+        export_df["日期"] = TODAY
+        export_df["总仓位建议"] = total_pos
+        export_df["标的平均评分"] = env["标的平均评分"]
+        export_df["市场活跃度"] = env["市场活跃度"]
+        export_df["成交额描述"] = env.get("成交额描述","")
+        export_df["市场环境"] = env["环境评级"]
+        export_df["市场评分"] = env["综合评分"]
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            file = os.path.join(os.environ.get('GITHUB_WORKSPACE','.'), f"市场环境监控_{TODAY}.xlsx")
+        else:
+            file = f"市场环境监控_{TODAY}.xlsx"
+        export_df.to_excel(file, index=False)
+        print(f"\n[完成] {file}")
+    except: pass
+    return {"scores":scores,"env":env,"diagnosis":{d["标的"]:d for d in diagnoses}}
+
+if __name__ == "__main__":
+    try: run()
+    except Exception as e: logger.error(f"运行出错: {e}", exc_info=True)
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        print("\n按回车键退出...")
+        input()
