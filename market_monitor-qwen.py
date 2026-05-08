@@ -1,15 +1,3 @@
-这是一个典型的 Python 缩进错误。在之前的代码生成中，`identify_bottom_fractal` 函数内部的逻辑块缩进出现了偏差，导致 `p0_body` 这一行被错误地识别为独立于函数或条件判断之外的代码。
-
-我已经修复了该缩进问题，并重新检查了整个文件的结构一致性。以下是**修正后、可直接运行**的完整代码（v5.1）。
-
-### 修复说明：
-1.  **修复缩进错误**：修正了 `identify_bottom_fractal` 函数中 `p0_body` 及后续变量的缩进，确保它们位于正确的逻辑块内。
-2.  **增强鲁棒性**：在 `calc_advanced_volume` 中优化了 OBV 计算循环，防止因数据缺失导致的潜在错误。
-3.  **依赖检查**：保留了 `scipy` 的自动安装逻辑，确保 GitHub Actions 环境中有线性回归所需的库。
-
-请将以下代码完整复制替换你的 `market_monitor.py` (或 `market_monitor-qwen.py`)：
-
-```python
 # market_monitor.py
 # 市场环境监控仪表盘 - GitHub Actions适配版 v5.1
 # 核心升级：引入 ADX, RSI, ATR, OBV, 线性回归等高级量化因子
@@ -59,8 +47,7 @@ def ensure_packages():
                     subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     logger.info(f"Installed {pkg} on the fly.")
                 except Exception as e:
-                    logger.error(f"Failed to install {pkg}: {e}")
-                    sys.exit(1)
+                    logger.error(f"Failed to install {pkg}: {e}")                    sys.exit(1)
             else:
                 logger.info(f"Installing missing package: {pkg}")
                 subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -109,8 +96,7 @@ def load_cache(code, data_type="stock", max_age_hours=4):
                     logger.info(f"使用缓存: {data_type}_{code} (已缓存{age_hours:.1f}小时)")
                     return df
             except Exception as e:
-                logger.debug(f"缓存读取失败: {e}, 删除旧缓存")
-                cache_file.unlink(missing_ok=True)
+                logger.debug(f"缓存读取失败: {e}, 删除旧缓存")                cache_file.unlink(missing_ok=True)
     return None
 
 def save_cache(df, code, data_type="stock"):
@@ -159,8 +145,7 @@ def normalize_turnover(x, source="default"):
     try:
         val = float(str(x).replace(',', ''))
     except:
-        return None
-    if pd.isna(val) or val <= 0:
+        return None    if pd.isna(val) or val <= 0:
         return None
     if val > 1e11:
         return val / 1e8
@@ -209,8 +194,7 @@ def identify_bottom_fractal(df):
              # 多头趋势中的底分型可能只是回调，这里简化处理，仍允许检测但降低置信度
              pass 
 
-    is_bottom = (p1['low'] < p2['low'] and p1['low'] < p0['low'] and 
-                 p1['high'] < p2['high'] and p1['high'] < p0['high'])
+    is_bottom = (p1['low'] < p2['low'] and p1['low'] < p0['low'] and                  p1['high'] < p2['high'] and p1['high'] < p0['high'])
     is_confirmed = p0['close'] > p1['high']
     
     vol_min10 = df['volume'].rolling(10).min().iloc[-1]
@@ -259,8 +243,7 @@ def get_stock_data(code, tail_size=500, use_cache=True):
         suffix = ".SS" if code.startswith("6") else ".SZ"
         ticker = yf.Ticker(f"{code}{suffix}")
         df = ticker.history(period="2y", timeout=15)
-        if df is not None and len(df) > 60:
-            df = df.tail(tail_size).copy().reset_index()
+        if df is not None and len(df) > 60:            df = df.tail(tail_size).copy().reset_index()
             df.rename(columns={"Date": "date", "Open": "open", "High": "high",
                                "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True)
             df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
@@ -309,8 +292,7 @@ def get_stock_data(code, tail_size=500, use_cache=True):
     # 数据源4：东方财富日线
     full_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
     df = safe_ak_call(ak.stock_zh_a_daily, symbol=full_code, adjust="qfq")
-    if df is not None and len(df) > 60:
-        df = df.tail(tail_size).copy()
+    if df is not None and len(df) > 60:        df = df.tail(tail_size).copy()
         for c in ["close", "open", "high", "low", "volume"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -359,8 +341,7 @@ def get_index_data(tail_size=500, use_cache=True):
             else:
                 df_result = df
                 if turnover:
-                    if use_cache:
-                        save_cache((df_result, turnover), "sh000001", "index")
+                    if use_cache:                        save_cache((df_result, turnover), "sh000001", "index")
                     return df_result, turnover
     
     # 数据源2：腾讯指数日线
@@ -409,8 +390,7 @@ def get_index_data(tail_size=500, use_cache=True):
 def get_gold_data(tail_size=500, use_cache=True):
     """获取黄金数据"""
     if use_cache:
-        cached = load_cache("AU0", "gold")
-        if cached is not None:
+        cached = load_cache("AU0", "gold")        if cached is not None:
             return cached
     
     # 数据源1：新浪期货主力合约
@@ -459,8 +439,7 @@ def calc_advanced_volatility(df):
     df = df.copy()
     try:
         # 1. ATR
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift(1))
+        high_low = df['high'] - df['low']        high_close = np.abs(df['high'] - df['close'].shift(1))
         low_close = np.abs(df['low'] - df['close'].shift(1))
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df['atr_14'] = tr.rolling(14).mean()
@@ -509,8 +488,7 @@ def calc_advanced_trend(df):
                         np.abs(df['high']-df['close'].shift(1)), 
                         np.abs(df['low']-df['close'].shift(1))], axis=1).max(axis=1)
         
-        atr_14 = tr.rolling(14).mean()
-        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+        atr_14 = tr.rolling(14).mean()        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
         minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
         
         dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
@@ -559,8 +537,7 @@ def calc_advanced_momentum(df):
     df = df.copy()
     try:
         # 1. RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        delta = df['close'].diff()        gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         df['rsi_14'] = 100 - (100 / (1 + rs))
@@ -609,8 +586,7 @@ def calc_advanced_volume(df):
         def rolling_corr_pv(window):
             if len(window) < 5: return 0
             return window['close'].corr(window['volume'])
-            
-        # Using apply is slow, but acceptable for small datasets. 
+                    # Using apply is slow, but acceptable for small datasets. 
         # For production, consider vectorized correlation if possible.
         df['pv_corr'] = df[['close', 'volume']].rolling(20).apply(
             lambda x: rolling_corr_pv(x), raw=False
@@ -659,8 +635,7 @@ def calc_factors(df, idx_df=None, gold_df=None):
     df["base_volatility_score"] = 1 - volatility.rolling(60).rank(pct=True).fillna(0.5)
     
     df["base_volume_score"] = (df["volume"] / df["volume"].rolling(20).mean()).clip(0.3, 2.0).fillna(1.0)
-    
-    # --- 高级因子计算 ---
+        # --- 高级因子计算 ---
     df = calc_advanced_volatility(df)
     df = calc_advanced_trend(df)
     df = calc_advanced_momentum(df)
@@ -709,7 +684,6 @@ def calc_factors(df, idx_df=None, gold_df=None):
         df["gold_beta_score"] = 0.5
     
     return df
-
 def calc_composite_scores(df, stock_name, role):
     """计算综合评分（v5.0 适配新因子）"""
     if len(df) < 60 or "close" not in df.columns:
@@ -759,8 +733,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
     vs = last.get("volatility_score", 0.5)
     
     # 波动诊断
-    if abs(rt) > 0.07:
-        vol_label = "剧烈上涨" if rt > 0 else "剧烈下跌"
+    if abs(rt) > 0.07:        vol_label = "剧烈上涨" if rt > 0 else "剧烈下跌"
     elif abs(rt) > 0.04:
         vol_label = "大幅上涨" if rt > 0 else "大幅下跌"
     elif abs(rt) > 0.02:
@@ -809,8 +782,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
     elif ma20 < ma60:
         if bias < -0.15:
             trend_label = "空头强势"
-        elif bias < -0.05:
-            trend_label = "空头排列"
+        elif bias < -0.05:            trend_label = "空头排列"
         else:
             trend_label = "空头尾声"
     else:
@@ -859,8 +831,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
         elif rs > 0.4:
             diag["大盘联动"] = "同步大盘"
         else:
-            diag["大盘联动"] = "弱于大盘"
-        
+            diag["大盘联动"] = "弱于大盘"        
         diag["距止损"] = f"{(close-26)/26*100:.1f}%"
         
         if close >= 28.5:
@@ -909,8 +880,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
             elif close >= 37:
                 diag["40元关口"] = "测试中"
             else:
-                diag["40元关口"] = "弱势"
-        else:
+                diag["40元关口"] = "弱势"        else:
             diag["底分型"] = "未形成"
             diag["止损参考"] = "N/A"
             diag["距止损"] = "N/A"
@@ -959,8 +929,7 @@ def calc_market_environment(scores, diags, turnover=None):
         env, adv = "牛市级", "确认信号后可积极"
     elif fs >= 0.60:
         env, adv = "强势震荡", "市场偏暖，留意加仓"
-    elif fs >= 0.45:
-        env, adv = "中性整理", "严格按信号操作"
+    elif fs >= 0.45:        env, adv = "中性整理", "严格按信号操作"
     elif fs >= 0.30:
         env, adv = "弱势承压", "注意防守"
     else:
@@ -1009,8 +978,7 @@ def run():
     separator = "=" * 60
     print(f"\n{separator}")
     print("  市场环境监控仪表盘 v5.1 (Advanced Factors)")
-    print(f"  运行时间: {beijing_now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
-    print(f"{separator}")
+    print(f"  运行时间: {beijing_now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")    print(f"{separator}")
     
     # 自检
     logger.info("系统自检...")
@@ -1059,8 +1027,7 @@ def run():
         row = {"标的": name, "角色": info["role"], "综合评分": round(sc, 3), **diag}
         rows.append(row)
     
-    # 市场环境
-    env = calc_market_environment(scores, diags, turnover)
+    # 市场环境    env = calc_market_environment(scores, diags, turnover)
     
     # 仓位建议
     pos_map = {0.75: "60-80%", 0.60: "40-60%", 0.45: "20-40%", 0.30: "10-20%"}
@@ -1109,8 +1076,7 @@ def run():
         
         # GitHub Actions使用workspace路径
         if is_github:
-            workspace = os.environ.get('GITHUB_WORKSPACE', '.')
-            fpath = os.path.join(workspace, f"市场环境监控_{TODAY}.xlsx")
+            workspace = os.environ.get('GITHUB_WORKSPACE', '.')            fpath = os.path.join(workspace, f"市场环境监控_{TODAY}.xlsx")
         else:
             fpath = f"市场环境监控_{TODAY}.xlsx"
         
@@ -1159,8 +1125,6 @@ if __name__ == "__main__":
         sys.exit(130)
     except Exception as e:
         logger.error(f"运行异常: {e}", exc_info=True)
-        if is_github:
-            import traceback
+        if is_github:            import traceback
             traceback.print_exc()
         sys.exit(1)
-```
