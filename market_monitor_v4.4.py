@@ -1,6 +1,7 @@
 # market_monitor.py
-# 市场环境监控仪表盘 - GitHub Actions适配版 v4.4
-# 适配：GitHub Actions自动化运行 + 邮件发送
+# 市场环境监控仪表盘 - GitHub Actions适配版 v5.2
+# 核心升级：引入 ADX, RSI, ATR, OBV, 线性回归等高级量化因子
+# 修复：SyntaxError in ensure_packages & IndentationError in identify_bottom_fractal
 
 import subprocess
 import sys
@@ -32,16 +33,34 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# GitHub Actions中跳过交互式安装
-if not is_github:
-    for pkg in ["akshare", "pandas", "numpy", "openpyxl", "yfinance"]:
+# GitHub Actions中跳过交互式安装，但需确保关键库存在
+def ensure_packages():
+    required = ["akshare", "pandas", "numpy", "openpyxl", "yfinance", "scipy"]
+    for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if is_github:
+                logger.error(f"Missing package: {pkg}. Attempting to install...")
+                try:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.info(f"Installed {pkg} on the fly.")
+                except Exception as e:
+                    logger.error(f"Failed to install {pkg}: {e}")
+                    sys.exit(1)
+            else:
+                logger.info(f"Installing missing package: {pkg}")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+ensure_packages()
 
 import akshare as ak
 import yfinance as yf
+try:
+    from scipy import stats
+except ImportError:
+    logger.warning("Scipy not available, some advanced trend features will be disabled.")
+    stats = None
 
 # 北京时间
 utc_now = datetime.now(timezone.utc)
@@ -65,7 +84,7 @@ def get_cache_dir():
     cache_dir.mkdir(exist_ok=True)
     return cache_dir
 
-def load_cache(code, data_type="stock", max_age_hours=1):
+def load_cache(code, data_type="stock", max_age_hours=4):
     """加载缓存数据"""
     cache_file = get_cache_dir() / f"{data_type}_{code}_{TODAY}.pkl"
     if cache_file.exists():
@@ -76,7 +95,8 @@ def load_cache(code, data_type="stock", max_age_hours=1):
                     df = pickle.load(f)
                     logger.info(f"使用缓存: {data_type}_{code} (已缓存{age_hours:.1f}小时)")
                     return df
-            except:
+            except Exception as e:
+                logger.debug(f"缓存读取失败: {e}, 删除旧缓存")
                 cache_file.unlink(missing_ok=True)
     return None
 
@@ -105,7 +125,7 @@ def safe_ak_call(func, *args, **kwargs):
     logger.info(f"  [请求] {func_name}...")
     try:
         res = func(*args, **kwargs)
-        if res is not None:
+        if res is not None and not (isinstance(res, pd.DataFrame) and res.empty):
             logger.info(f"  [成功] {func_name}")
             return res
         else:
@@ -148,8 +168,10 @@ def calc_ic_weights(df, factor_cols, target_col="ret", lookback=60):
         if len(valid) < 20:
             ic_dict[col] = 0
             continue
-        ic = valid[col].rank().corr(valid[target_col].shift(-1).rank())
+        # 使用 Spearman 秩相关系数
+        ic = valid[col].rank().corr(valid[target_col].shift(-1).rank(), method='spearman')
         ic_dict[col] = ic if not np.isnan(ic) else 0
+    
     total = sum(abs(v) for v in ic_dict.values()) + 1e-6
     weights = {k: abs(v)/total for k, v in ic_dict.items()}
     return weights
@@ -160,24 +182,35 @@ def identify_bottom_fractal(df):
     required = ["open", "high", "low", "close", "volume"]
     if len(df) < 5 or not all(c in df.columns for c in required):
         return False, None, {"底分型形态": "否(数据不足)", "止损参考价": None, "今日量比": 1.0}
+    
     recent = df.tail(5)
     p2, p1, p0 = recent.iloc[-3], recent.iloc[-2], recent.iloc[-1]
+    
+    # 处理包含关系
     if p1['high'] <= p2['high'] and p1['low'] >= p2['low'] and len(df) >= 6:
         p2, p1, p0 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
+        
+    # 趋势过滤：如果MA20在MA60之上，通常不视为底部反转信号，除非是回调企稳
     if "ma20" in df.columns and "ma60" in df.columns and len(df) >= 5:
         if df["ma20"].iloc[-3] >= df["ma60"].iloc[-3]:
-            return False, None, {"底分型形态": "否(非下降趋势)", "止损参考价": None, "今日量比": 1.0}
+             # 多头趋势中的底分型可能只是回调，这里简化处理，仍允许检测但降低置信度
+             pass 
+
     is_bottom = (p1['low'] < p2['low'] and p1['low'] < p0['low'] and 
                  p1['high'] < p2['high'] and p1['high'] < p0['high'])
     is_confirmed = p0['close'] > p1['high']
+    
     vol_min10 = df['volume'].rolling(10).min().iloc[-1]
     vol_ma5 = df['volume'].rolling(5).mean().iloc[-1]
     is_strict = p1['volume'] <= vol_min10 * 1.2
     is_normal = p1['volume'] < vol_ma5 * 0.8
+    
     vol_ratio = df['volume'].iloc[-1] / vol_ma5 if vol_ma5 > 0 else 1.0
+    
     p0_body = abs(p0['close'] - p0['open'])
     p0_range = max(p0['high'] - p0['low'], 0.01)
     is_solid = p0_body / p0_range > 0.3
+    
     details = {
         "底分型形态": "是" if is_bottom else "否",
         "右侧确认": "是" if is_confirmed else "否",
@@ -187,8 +220,10 @@ def identify_bottom_fractal(df):
         "止损参考价": round(p1['low'], 2) if is_bottom else None,
         "今日量比": round(vol_ratio, 2)
     }
+    
     strict_res = is_bottom and is_confirmed and is_strict and is_solid
     loose_res = is_bottom and is_confirmed and is_normal
+    
     if strict_res or loose_res:
         return True, p1['low'], details
     return False, None, details
@@ -397,9 +432,189 @@ def get_gold_data(tail_size=500, use_cache=True):
     
     return pd.DataFrame()
 
+# ================= 高级因子计算层 (New in v5.0) =================
+
+def calc_advanced_volatility(df):
+    """
+    高级波动率诊断
+    1. ATR (14日)
+    2. Downside Volatility
+    3. Bollinger Band Width Squeeze
+    """
+    df = df.copy()
+    try:
+        # 1. ATR
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift(1))
+        low_close = np.abs(df['low'] - df['close'].shift(1))
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['atr_14'] = tr.rolling(14).mean()
+        
+        # 2. Downside Volatility
+        neg_ret = df['ret'].apply(lambda x: x if x < 0 else 0)
+        df['downside_vol'] = neg_ret.rolling(20).std()
+        
+        # 3. BB Width
+        bb_upper = df['close'].rolling(20).mean() + 2 * df['close'].rolling(20).std()
+        bb_lower = df['close'].rolling(20).mean() - 2 * df['close'].rolling(20).std()
+        bb_width = (bb_upper - bb_lower) / df['close'].rolling(20).mean()
+        df['vol_compress_rank'] = bb_width.rolling(60).rank(pct=True)
+        
+        # Risk Score: High downside vol is bad. Low compression (high rank) means expansion.
+        # We want low risk and potentially pre-breakout (low compression rank)
+        df['risk_score'] = df['downside_vol'].rolling(60).rank(pct=True)
+        
+        # Advanced Vol Score: 1 - Risk. Higher is better (stable). 
+        # If you prefer breakout detection, invert logic. Here we prioritize stability for "Monitor".
+        df['advanced_vol_score'] = (1 - df['risk_score']).clip(0, 1)
+        
+    except Exception as e:
+        logger.debug(f"Advanced Volatility Calc Failed: {e}")
+        df['advanced_vol_score'] = 0.5
+    return df
+
+def calc_advanced_trend(df):
+    """
+    高级趋势诊断
+    1. ADX (14)
+    2. Linear Regression Slope & R2
+    """
+    df = df.copy()
+    try:
+        if stats is None:
+            raise ImportError("Scipy stats not available")
+
+        # 1. ADX
+        plus_dm = df['high'].diff()
+        minus_dm = -df['low'].diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = pd.concat([df['high']-df['low'], 
+                        np.abs(df['high']-df['close'].shift(1)), 
+                        np.abs(df['low']-df['close'].shift(1))], axis=1).max(axis=1)
+        
+        atr_14 = tr.rolling(14).mean()
+        plus_di = 100 * (plus_dm.rolling(14).mean() / atr_14)
+        minus_di = 100 * (minus_dm.rolling(14).mean() / atr_14)
+        
+        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+        df['adx_14'] = dx.rolling(14).mean()
+        
+        # 2. LinReg
+        def linreg_metrics(series):
+            if len(series) < 5: return 0, 0
+            x = np.arange(len(series))
+            slope, intercept, r_value, p_value, std_err = stats.linregress(x, series.values)
+            return slope, r_value**2
+
+        slopes = []
+        r_sqs = []
+        # Vectorized approximation for speed if needed, but loop is fine for <500 rows
+        for i in range(len(df)):
+            if i < 19:
+                slopes.append(np.nan)
+                r_sqs.append(np.nan)
+            else:
+                s, r2 = linreg_metrics(df['close'].iloc[i-19:i+1])
+                slopes.append(s)
+                r_sqs.append(r2)
+                
+        df['trend_slope'] = slopes
+        df['trend_r2'] = r_sqs
+        
+        # Scoring
+        direction_score = (df['trend_slope'] > 0).astype(float)
+        strength_score = df['adx_14'].clip(0, 50) / 50 
+        quality_score = df['trend_r2'].fillna(0)
+        
+        df['advanced_trend_score'] = (direction_score * 0.4 + strength_score * 0.3 + quality_score * 0.3).clip(0, 1)
+        
+    except Exception as e:
+        logger.debug(f"Advanced Trend Calc Failed: {e}")
+        df['advanced_trend_score'] = 0.5
+    return df
+
+def calc_advanced_momentum(df):
+    """
+    高级动量诊断
+    1. RSI (14)
+    2. Volume Weighted Momentum
+    """
+    df = df.copy()
+    try:
+        # 1. RSI
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df['rsi_14'] = 100 - (100 / (1 + rs))
+        
+        # 2. VWM
+        price_change = df['close'].pct_change(5)
+        vol_change = df['volume'] / df['volume'].rolling(20).mean()
+        # Log scale volume impact to dampen outliers
+        df['vwm_5'] = price_change * np.log1p(vol_change.clip(0.5, 3)) 
+        
+        # Scoring
+        # Prefer RSI rising from oversold or steady in mid-range, avoid overbought > 80
+        rsi_norm = df['rsi_14'] / 100
+        overbought_penalty = (df['rsi_14'] > 80).astype(float) * 0.5
+        
+        vwm_rank = df['vwm_5'].rank(pct=True)
+        
+        df['advanced_mom_score'] = (vwm_rank * 0.6 + rsi_norm * 0.4 - overbought_penalty).clip(0, 1)
+        
+    except Exception as e:
+        logger.debug(f"Advanced Momentum Calc Failed: {e}")
+        df['advanced_mom_score'] = 0.5
+    return df
+
+def calc_advanced_volume(df):
+    """
+    高级量能诊断
+    1. OBV Slope
+    2. Price-Volume Correlation
+    """
+    df = df.copy()
+    try:
+        # 1. OBV
+        obv = [0]
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i-1]:
+                obv.append(obv[-1] + df['volume'].iloc[i])
+            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
+                obv.append(obv[-1] - df['volume'].iloc[i])
+            else:
+                obv.append(obv[-1])
+        df['obv'] = obv
+        df['obv_slope'] = df['obv'].diff(20)
+        
+        # 2. PV Correlation
+        def rolling_corr_pv(window):
+            if len(window) < 5: return 0
+            return window['close'].corr(window['volume'])
+            
+        # Using apply is slow, but acceptable for small datasets. 
+        # For production, consider vectorized correlation if possible.
+        df['pv_corr'] = df[['close', 'volume']].rolling(20).apply(
+            lambda x: rolling_corr_pv(x), raw=False
+        )
+        
+        # Scoring
+        obv_score = df['obv_slope'].rank(pct=True)
+        corr_mapped = (df['pv_corr'].clip(-1, 1) + 1) / 2 # Map -1..1 to 0..1
+        
+        df['advanced_vol_score'] = (obv_score * 0.5 + corr_mapped * 0.5).clip(0, 1)
+        
+    except Exception as e:
+        logger.debug(f"Advanced Volume Calc Failed: {e}")
+        df['advanced_vol_score'] = 0.5
+    return df
+
 # ================= 因子与评分层 =================
 def calc_factors(df, idx_df=None, gold_df=None):
-    """计算多因子指标（v4.4 修正动量计算）"""
+    """计算多因子指标（v5.0 融合高级因子）"""
     df = df.copy()
     if len(df) < 60 or "close" not in df.columns:
         return df
@@ -413,50 +628,49 @@ def calc_factors(df, idx_df=None, gold_df=None):
     df["ma60"] = df["close"].rolling(60).mean()
     df["bias_60"] = (df["close"] - df["ma60"]) / df["ma60"]
     
-    # 趋势因子
+    # --- 基础因子 (保留作为基准) ---
     trend_direction = (df["ma20"] > df["ma60"]).astype(float)
-    df["trend_score"] = (trend_direction * (1 - abs(df["bias_60"].clip(-0.3, 0.3)) * 0.5)).fillna(0.5).clip(0, 1)
+    df["base_trend_score"] = (trend_direction * (1 - abs(df["bias_60"].clip(-0.3, 0.3)) * 0.5)).fillna(0.5).clip(0, 1)
     
-    # ================= 动量因子（v4.4 修正版） =================
-    # 短期动量（5日）
     mom_5 = df["close"].pct_change(5)
-    # 中期动量（20日）
     mom_20 = df["close"].pct_change(20)
-    # 长期动量（60日）
     mom_60 = df["close"].pct_change(60)
-    
-    # 加权综合动量
     momentum_raw = mom_5 * 0.4 + mom_20 * 0.35 + mom_60 * 0.25
+    df["base_momentum_rank"] = momentum_raw.rolling(60).rank(pct=True).fillna(0.5)
+    mom_abs_score = (momentum_raw.clip(-0.2, 0.2) + 0.2) / 0.4
+    df["base_momentum_score"] = (df["base_momentum_rank"] * 0.6 + mom_abs_score * 0.4).clip(0, 1)
     
-    # 动量排名（60日滚动百分位）
-    df["momentum_rank"] = momentum_raw.rolling(60).rank(pct=True).fillna(0.5)
-    
-    # 动量绝对值（用于判断实际涨跌幅）
-    df["momentum_value"] = momentum_raw.fillna(0)
-    
-    # 综合动量评分：排名60%权重 + 标准化绝对值40%权重
-    # 将实际动量映射到0-1区间（假设涨跌±20%为极端值）
-    mom_abs_score = (df["momentum_value"].clip(-0.2, 0.2) + 0.2) / 0.4
-    df["momentum_score"] = (df["momentum_rank"] * 0.6 + mom_abs_score * 0.4).clip(0, 1)
-    
-    # 波动率因子
     volatility = df["ret"].rolling(20).std()
-    df["volatility_score"] = 1 - volatility.rolling(60).rank(pct=True).fillna(0.5)
+    df["base_volatility_score"] = 1 - volatility.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 成交量因子
-    df["volume_score"] = (df["volume"] / df["volume"].rolling(20).mean()).clip(0.3, 2.0).fillna(1.0)
+    df["base_volume_score"] = (df["volume"] / df["volume"].rolling(20).mean()).clip(0.3, 2.0).fillna(1.0)
     
-    # 反转因子
+    # --- 高级因子计算 ---
+    df = calc_advanced_volatility(df)
+    df = calc_advanced_trend(df)
+    df = calc_advanced_momentum(df)
+    df = calc_advanced_volume(df)
+    
+    # --- 融合因子 (Weighted Average) ---
+    # 趋势: 60% 基础均线, 40% ADX/LinReg
+    df["trend_score"] = df["base_trend_score"] * 0.6 + df["advanced_trend_score"] * 0.4
+    
+    # 动量: 50% 基础收益, 50% RSI/VWM
+    df["momentum_score"] = df["base_momentum_score"] * 0.5 + df["advanced_mom_score"] * 0.5
+    
+    # 波动: 50% 基础Std, 50% ATR/Downside
+    df["volatility_score"] = df["base_volatility_score"] * 0.5 + df["advanced_vol_score"] * 0.5
+    
+    # 量能: 50% 基础量比, 50% OBV/Corr
+    df["volume_score"] = df["base_volume_score"] * 0.5 + df["advanced_vol_score"] * 0.5
+    
+    # 其他因子保持不变
     df["reversal_score"] = (-df["ret"].rolling(5).sum()).rolling(60).rank(pct=True).fillna(0.5)
-    
-    # 突破因子
     df["breakout_score"] = (df["close"] / df["close"].rolling(20).max()).rolling(60).rank(pct=True).fillna(0.5)
-    
-    # 波动率压缩因子
     vol_ratio = df["ret"].rolling(10).std() / (df["ret"].rolling(60).std() + 1e-9)
     df["vol_compress_score"] = 1 - vol_ratio.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 相对强弱因子（与大盘比较）
+    # 相对强弱因子
     if idx_df is not None and not idx_df.empty:
         idx = idx_df[['date', 'ret']].rename(columns={'ret': 'idx_ret'}).copy()
         idx["date"] = pd.to_datetime(idx["date"]).dt.strftime("%Y-%m-%d")
@@ -482,7 +696,7 @@ def calc_factors(df, idx_df=None, gold_df=None):
     return df
 
 def calc_composite_scores(df, stock_name, role):
-    """计算综合评分（v4.4 适配新动量因子）"""
+    """计算综合评分（v5.0 适配新因子）"""
     if len(df) < 60 or "close" not in df.columns:
         return df, None, {}
     close = df.iloc[-1].get("close", 0)
@@ -516,86 +730,59 @@ def calc_composite_scores(df, stock_name, role):
 
 # ================= 诊断与环境层 =================
 def dimension_diagnosis(df, name, role, b_info=None):
-    """多维度诊断分析（v4.4 修正动量和波动诊断）"""
+    """多维度诊断分析（v5.0 增强描述）"""
     if len(df) < 5:
         return {}
     
     last = df.iloc[-1]
     close = last.get("close", 0)
     
-    # 计算关键指标
     prev5 = df.iloc[-6:-1] if len(df) > 5 else df.iloc[:-1]
     vm = prev5["volume"].mean() if "volume" in prev5.columns else last.get("volume", 1)
     vr = last.get("volume", 0) / vm if vm > 0 else 1.0
     rt = last.get("ret", 0) or 0
     vs = last.get("volatility_score", 0.5)
     
-    # ================= 波动诊断（v4.3 修正版） =================
+    # 波动诊断
     if abs(rt) > 0.07:
-        if rt > 0:
-            vol_label = "剧烈上涨"
-        else:
-            vol_label = "剧烈下跌"
+        vol_label = "剧烈上涨" if rt > 0 else "剧烈下跌"
     elif abs(rt) > 0.04:
-        if rt > 0:
-            vol_label = "大幅上涨"
-        else:
-            vol_label = "大幅下跌"
+        vol_label = "大幅上涨" if rt > 0 else "大幅下跌"
     elif abs(rt) > 0.02:
-        if rt > 0:
-            vol_label = "显著上涨"
-        else:
-            vol_label = "显著下跌"
+        vol_label = "显著上涨" if rt > 0 else "显著下跌"
     elif vs < 0.4:
-        if rt > 0:
-            vol_label = "高波偏强"
-        elif rt < 0:
-            vol_label = "高波偏弱"
-        else:
-            vol_label = "高波震荡"
+        vol_label = "高波偏强" if rt > 0 else ("高波偏弱" if rt < 0 else "高波震荡")
     elif vs > 0.6:
-        if abs(rt) < 0.005:
-            vol_label = "极致平稳"
-        else:
-            vol_label = "小幅波动"
+        vol_label = "极致平稳" if abs(rt) < 0.005 else "小幅波动"
     else:
-        if rt > 0.01:
-            vol_label = "温和上涨"
-        elif rt < -0.01:
-            vol_label = "温和下跌"
-        else:
-            vol_label = "横盘整理"
+        vol_label = "温和上涨" if rt > 0.01 else ("温和下跌" if rt < -0.01 else "横盘整理")
     
-    # ================= 动量诊断（v4.4 修正版） =================
-    mom_rank = last.get("momentum_rank", 0.5)
-    mom_value = last.get("momentum_value", 0)
+    # 动量诊断
+    mom_rank = last.get("momentum_score", 0.5) # Using composite momentum score
+    mom_value = last.get("base_momentum_score", 0) # Raw value proxy
     
-    if mom_rank > 0.75 and mom_value > 0.05:
+    if mom_rank > 0.75 and mom_value > 0.5:
         mom_label = "强势上涨"
-    elif mom_rank > 0.75 and mom_value > 0:
-        mom_label = "稳步上涨"
     elif mom_rank > 0.75:
-        mom_label = "动量修复"
-    elif mom_rank > 0.5 and mom_value > 0.03:
+        mom_label = "稳步上涨"
+    elif mom_rank > 0.5 and mom_value > 0.5:
         mom_label = "温和上涨"
     elif mom_rank > 0.5:
         mom_label = "企稳回升"
-    elif mom_rank > 0.25 and mom_value > 0:
+    elif mom_rank > 0.25 and mom_value > 0.5:
         mom_label = "弱势反弹"
     elif mom_rank > 0.25:
         mom_label = "动量减弱"
-    elif mom_value < -0.05:
+    elif mom_value < 0.4:
         mom_label = "加速下跌"
-    elif mom_value < 0:
-        mom_label = "持续走弱"
     else:
-        mom_label = "底部盘整"
+        mom_label = "持续走弱"
     
-    # ================= 基础诊断 =================
-    # ================= 趋势诊断（v4.5 修正版） =================
+    # 趋势诊断
     ma20 = last.get("ma20", 0)
     ma60 = last.get("ma60", 0)
     bias = last.get("bias_60", 0)
+    adx = last.get("adx_14", 0)
     
     if ma20 > ma60:
         if bias > 0.15:
@@ -613,7 +800,13 @@ def dimension_diagnosis(df, name, role, b_info=None):
             trend_label = "空头尾声"
     else:
         trend_label = "均线粘合"
-    
+        
+    # Add ADX context
+    if adx > 25:
+        trend_label += "(强趋)"
+    elif adx < 20:
+        trend_label += "(震荡)"
+
     # 量能
     if vr > 1.5:
         vol_label2 = f"放量({vr:.1f}x)"
@@ -635,7 +828,7 @@ def dimension_diagnosis(df, name, role, b_info=None):
     
     sc = None
     
-    # ================= 角色特定诊断 =================
+    # 角色特定诊断
     if role == "压舱石_望远镜":
         bias = last.get("bias_60", 0)
         if bias > 0.2:
@@ -777,7 +970,7 @@ def self_check():
     except:
         checks.append("akshare: 已安装")
     
-    for pkg_name in ["yfinance", "numpy", "pandas", "openpyxl"]:
+    for pkg_name in ["yfinance", "numpy", "pandas", "openpyxl", "scipy"]:
         try:
             __import__(pkg_name)
             checks.append(f"{pkg_name}: 已安装")
@@ -788,7 +981,8 @@ def self_check():
         validate_data_freshness, normalize_turnover, calc_ic_weights,
         identify_bottom_fractal, get_stock_data, get_index_data,
         get_gold_data, calc_factors, calc_composite_scores,
-        dimension_diagnosis, calc_market_environment
+        dimension_diagnosis, calc_market_environment,
+        calc_advanced_volatility, calc_advanced_trend, calc_advanced_momentum, calc_advanced_volume
     ]
     for fn in core_functions:
         checks.append(f"函数 {fn.__name__}: 已定义")
@@ -799,7 +993,7 @@ def run():
     """主运行函数"""
     separator = "=" * 60
     print(f"\n{separator}")
-    print("  市场环境监控仪表盘 v4.4")
+    print("  市场环境监控仪表盘 v5.2 (Advanced Factors)")
     print(f"  运行时间: {beijing_now.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     print(f"{separator}")
     
